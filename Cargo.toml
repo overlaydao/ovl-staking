@@ -1,5 +1,5 @@
 [package]
-name = "overlay-oio-contract-v0"
+name = "ovl-staking"
 version = "0.1.0"
 authors = ["kosamit <kosamit@gmail.com>"]
 edition = "2018"
