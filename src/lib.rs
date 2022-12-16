@@ -397,7 +397,6 @@ fn contract_stake<S: HasStateApi>(
     ensure!(!host.state().paused, ContractError::ContractPaused);
 
     let params: StakeParams = ctx.parameter_cursor().get()?;
-    // Ensure that the sender is an account.
     let sender = ctx.sender();
 
     // transferできたらstakeの実行をする
@@ -437,7 +436,6 @@ fn contract_unstake<S: HasStateApi>(
     ensure!(!host.state().paused, ContractError::ContractPaused);
 
     let params: UnstakeParams = ctx.parameter_cursor().get()?;
-    // Ensure that the sender is an account.
 
     let sender = match ctx.sender() {
         Address::Account(sender) => sender,
@@ -478,7 +476,6 @@ fn contract_view_stake<S: HasStateApi>(
 ) -> ContractResult<ViewStakeResponse> {
     let params: ViewStakeParams = ctx.parameter_cursor().get()?;
     let staked_ovl_credits = host.state().get_staked_ovl_credits(&params.owner);
-    // let stakes = host.state().stakes.get(&params.owner);
     let stake_state = host.state().stakes.get(&params.owner).unwrap();
     let state = ViewStakeResponse {
         amount: stake_state.amount,
@@ -588,16 +585,15 @@ mod tests {
         };
 
         let tier_bases = collections::BTreeMap::from([
-            (100000u64, tier1),
-            (200000u64,tier2),
-            (500000u64, tier3),
-            (1250000u64, tier4),
-            (2500000u64, tier5)
+            (100_000_000_000u64, tier1),
+            (200_000_000_000u64,tier2),
+            (500_000_000_000u64, tier3),
+            (1_250_000_000_000u64, tier4),
+            (2_500_000_000_000u64, tier5),
         ]);
         let state = State::new(state_builder, ADMIN_ADDRESS, tier_bases);
         state
     }
-
     #[concordium_test]
     fn test_init() {
         // Set up the context
@@ -606,31 +602,31 @@ mod tests {
 
         // Set up the parameter.
         let tier1 = TierBaseParams {
-            threshold: 100000,
+            threshold: 100_000_000_000,
             max_alloc: 2,
             rate: 105,
         };
 
         let tier2 = TierBaseParams {
-            threshold: 200000,
+            threshold: 200_000_000_000,
             max_alloc: 4,
             rate: 110,
         };
 
         let tier3 = TierBaseParams {
-            threshold: 500000,
+            threshold: 500_000_000_000,
             max_alloc: 8,
             rate: 115,
         };
 
         let tier4 = TierBaseParams {
-            threshold: 1250000,
+            threshold: 1_250_000_000_000,
             max_alloc: 16,
             rate: 120,
         };
 
         let tier5 = TierBaseParams {
-            threshold: 2500000,
+            threshold: 2_500_000_000_000,
             max_alloc: 32,
             rate: 125,
         };
@@ -692,33 +688,33 @@ mod tests {
 
         // Set up the parameter.
         let tier1 = TierBaseParams {
-            threshold: 150000,
+            threshold: 150_000_000_000,
             max_alloc: 2,
             rate: 105,
         };
 
         let tier2 = TierBaseParams {
-            threshold: 200000,
+            threshold: 200_000_000_000,
             max_alloc: 4,
             rate: 110,
         };
 
         let tier3 = TierBaseParams {
-            threshold: 300000,
+            threshold: 300_000_000_000,
             max_alloc: 8,
-            rate: 115,
-        };
-
-        let tier4 = TierBaseParams {
-            threshold: 1250000,
-            max_alloc: 16,
             rate: 120,
         };
 
+        let tier4 = TierBaseParams {
+            threshold: 1_250_000_000_000,
+            max_alloc: 16,
+            rate: 130,
+        };
+
         let tier5 = TierBaseParams {
-            threshold: 2500000,
+            threshold: 3_000_000_000_000,
             max_alloc: 32,
-            rate: 125,
+            rate: 140,
         };
 
         let params = vec![tier1,tier2, tier3, tier4, tier5];
