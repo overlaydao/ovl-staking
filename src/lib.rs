@@ -778,6 +778,61 @@ mod tests {
     }
 
     #[concordium_test]
+    fn test_deposit_ovl_credit() {
+        // Set up the context
+        let mut ctx = TestReceiveContext::empty();
+        ctx.set_sender(ADMIN_ADDRESS);
+
+        let self_address = ContractAddress::new(2249, 0);
+        ctx.set_self_address(self_address);
+
+        ctx.metadata_mut().set_slot_time(Timestamp::from_timestamp_millis(100));
+
+        // Set up the parameter.
+        let params = StakeParams {
+            amount:   ContractTokenAmount::from(1000),
+        };
+        let parameter_bytes = to_bytes(&params);
+        ctx.set_parameter(&parameter_bytes);
+
+        let _logger = TestLogger::init();
+        let mut state_builder = TestStateBuilder::new();
+        let state = initial_state(&mut state_builder);
+        let mut host = TestHost::new(state, state_builder);
+
+        let result: ContractResult<()> = contract_stake(&ctx, &mut host);
+        println!("{:?}", result);
+
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
+
+        let params2 = ViewStakeParams {
+            owner:   ADMIN_ADDRESS
+        };
+        let parameter_bytes2 = to_bytes(&params2);
+        ctx.set_parameter(&parameter_bytes2);
+        let result2: ContractResult<ViewStakeResponse> = contract_view_stake(&ctx, &mut host);
+        println!("{:?}", result2);
+
+        let params3 = DepositOvlCreditParams {
+            project_address:  ContractAddress::new(2249, 0),
+            ovl_credit_amount: 1000,
+        };
+
+        let parameter_bytes3 = to_bytes(&params3);
+        ctx.set_parameter(&parameter_bytes3);
+        let result3: ContractResult<()> = contract_deposit_ovl_credit(&ctx, &mut host);
+        println!("{:?}", result);
+
+        claim!(result3.is_ok(), "Results in rejection");
+
+        let parameter_bytes2 = to_bytes(&params2);
+        ctx.set_parameter(&parameter_bytes2);
+        let result4: ContractResult<ViewStakeResponse> = contract_view_stake(&ctx, &mut host);
+        println!("{:?}", result4);
+    }
+
+    #[concordium_test]
     fn test_update_tier_base() {
         // Set up the context
         let mut ctx = TestReceiveContext::empty();
