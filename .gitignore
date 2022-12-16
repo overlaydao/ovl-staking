@@ -22,3 +22,4 @@ pkg
 Cargo.lock
 
 tmp*
+test.sh

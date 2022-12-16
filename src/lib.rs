@@ -206,7 +206,7 @@ impl<S: HasStateApi> State<S> {
         stake.start_at = *start_at;
 
         let tier_bases = &self.tier_bases;
-        let mut index = (vec!(tier_bases).len() as u8) - 1;
+        let mut index = tier_bases.len();
 
         let mut staked_ovl_credit = 0u64;
         for (_project_address, ovl_credit) in stake.staked_ovl_credits.iter() {
@@ -221,7 +221,7 @@ impl<S: HasStateApi> State<S> {
                 ovl_credit_str.pop();
                 ovl_credit_str.pop();
 
-                stake.tier = index;
+                stake.tier = index as u8;
                 stake.ovl_credit_amount = ovl_credit_str.parse::<u64>().unwrap();
                 stake.available_ovl_credit_amount = stake.ovl_credit_amount - staked_ovl_credit;
                 break;
@@ -252,7 +252,7 @@ impl<S: HasStateApi> State<S> {
 
         let after_amount = curr_amount - u64::from(*amount);
         let tier_bases = &self.tier_bases;
-        let mut index = (vec!(tier_bases).len() as u8) - 1;
+        let mut index = tier_bases.len();
 
         let mut staked_ovl_credit = 0u64;
         for (_project_address, ovl_credit) in stake.staked_ovl_credits.iter() {
@@ -272,7 +272,7 @@ impl<S: HasStateApi> State<S> {
                 ensure!(ovl_credit_amount as i128 - staked_ovl_credit as i128 >= 0, ContractError::InsufficientOvlCredit);
                 stake.amount = TokenAmountU64::from(after_amount);
                 stake.start_at = *start_at;
-                stake.tier = index;
+                stake.tier = index as u8;
                 stake.ovl_credit_amount = ovl_credit_amount;
                 stake.available_ovl_credit_amount = ovl_credit_amount - staked_ovl_credit;
                 break;
@@ -585,11 +585,11 @@ mod tests {
         };
 
         let tier_bases = collections::BTreeMap::from([
-            (100_000_000_000u64, tier1),
-            (200_000_000_000u64,tier2),
-            (500_000_000_000u64, tier3),
-            (1_250_000_000_000u64, tier4),
-            (2_500_000_000_000u64, tier5),
+            (1000u64, tier1),
+            (2000u64,tier2),
+            (3000u64, tier3),
+            (4000u64, tier4),
+            (5000u64, tier5),
         ]);
         let state = State::new(state_builder, ADMIN_ADDRESS, tier_bases);
         state
@@ -642,43 +642,95 @@ mod tests {
         result.expect_report("Contract initialization failed");
     }
 
-    // #[concordium_test]
-    // fn test_stake() {
-    //     // Set up the context
-    //     let mut ctx = TestReceiveContext::empty();
-    //     ctx.set_sender(ADMIN_ADDRESS);
+    #[concordium_test]
+    fn test_stake() {
+        // Set up the context
+        let mut ctx = TestReceiveContext::empty();
+        ctx.set_sender(ADMIN_ADDRESS);
 
-    //     let self_address = ContractAddress::new(2190, 0);
-    //     ctx.set_self_address(self_address);
+        let self_address = ContractAddress::new(2249, 0);
+        ctx.set_self_address(self_address);
 
-    //     ctx.metadata_mut().set_slot_time(Timestamp::from_timestamp_millis(100));
+        ctx.metadata_mut().set_slot_time(Timestamp::from_timestamp_millis(100));
 
-    //     // Set up the parameter.
-    //     let params = StakeParams {
-    //         amount:   ContractTokenAmount::from(1000),
-    //     };
-    //     let parameter_bytes = to_bytes(&params);
-    //     ctx.set_parameter(&parameter_bytes);
+        // Set up the parameter.
+        let params = StakeParams {
+            amount:   ContractTokenAmount::from(1000),
+        };
+        let parameter_bytes = to_bytes(&params);
+        ctx.set_parameter(&parameter_bytes);
 
-    //     let _logger = TestLogger::init();
-    //     let mut state_builder = TestStateBuilder::new();
-    //     let state = initial_state(&mut state_builder);
-    //     let mut host = TestHost::new(state, state_builder);
+        let _logger = TestLogger::init();
+        let mut state_builder = TestStateBuilder::new();
+        let state = initial_state(&mut state_builder);
+        let mut host = TestHost::new(state, state_builder);
 
-    //     let result: ContractResult<()> = contract_stake(&ctx, &mut host);
-    //     println!("{:?}", result);
+        let result: ContractResult<()> = contract_stake(&ctx, &mut host);
+        println!("{:?}", result);
 
-    //     // Check the result.
-    //     claim!(result.is_ok(), "Results in rejection");
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
 
-    //     let params2 = ViewStakeParams {
-    //         owner:   ADMIN_ADDRESS
-    //     };
-    //     let parameter_bytes2 = to_bytes(&params2);
-    //     ctx.set_parameter(&parameter_bytes2);
-    //     let result2: ContractResult<ViewStakeResponse> = contract_view_stake(&ctx, &mut host);
-    //     println!("{:?}", result2);
-    // }
+        let params2 = ViewStakeParams {
+            owner:   ADMIN_ADDRESS
+        };
+        let parameter_bytes2 = to_bytes(&params2);
+        ctx.set_parameter(&parameter_bytes2);
+        let result2: ContractResult<ViewStakeResponse> = contract_view_stake(&ctx, &mut host);
+        println!("{:?}", result2);
+    }
+
+    #[concordium_test]
+    fn test_unstake() {
+        // Set up the context
+        let mut ctx = TestReceiveContext::empty();
+        ctx.set_sender(ADMIN_ADDRESS);
+
+        let self_address = ContractAddress::new(2249, 0);
+        ctx.set_self_address(self_address);
+
+        ctx.metadata_mut().set_slot_time(Timestamp::from_timestamp_millis(100));
+
+        // Set up the parameter.
+        let params = StakeParams {
+            amount:   ContractTokenAmount::from(5000),
+        };
+        let parameter_bytes = to_bytes(&params);
+        ctx.set_parameter(&parameter_bytes);
+
+        let _logger = TestLogger::init();
+        let mut state_builder = TestStateBuilder::new();
+        let state = initial_state(&mut state_builder);
+        let mut host = TestHost::new(state, state_builder);
+
+        let result: ContractResult<()> = contract_stake(&ctx, &mut host);
+        println!("{:?}", result);
+
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
+
+        let params2 = ViewStakeParams {
+            owner:   ADMIN_ADDRESS
+        };
+        let parameter_bytes2 = to_bytes(&params2);
+        ctx.set_parameter(&parameter_bytes2);
+        let result2: ContractResult<ViewStakeResponse> = contract_view_stake(&ctx, &mut host);
+        println!("{:?}", result2);
+
+        let params3 = UnstakeParams {
+            amount:   ContractTokenAmount::from(1000),
+        };
+        let parameter_bytes3 = to_bytes(&params3);
+        ctx.set_parameter(&parameter_bytes3);
+        let result3: ContractResult<()> = contract_unstake(&ctx, &mut host);
+        println!("{:?}", result3);
+
+        let parameter_bytes2 = to_bytes(&params2);
+        ctx.set_parameter(&parameter_bytes2);
+        let result4: ContractResult<ViewStakeResponse> = contract_view_stake(&ctx, &mut host);
+        println!("{:?}", result4);
+
+    }
 
     #[concordium_test]
     fn test_update_tier_base() {
