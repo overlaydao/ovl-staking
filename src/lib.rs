@@ -44,7 +44,7 @@ impl<S: HasStateApi> StakeState<S> {
         StakeState {
             amount: 0u64.into(),
             start_at,
-            claimable_ovl: TokenAmountU64(0u64),
+            claimable_ovl: 0u64.into(),
             tier: 0u8.into(),
             staked_ovl_credits: state_builder.new_map(),
             ovl_credit_amount: 0u64.into(),
@@ -248,7 +248,7 @@ impl<S: HasStateApi> State<S> {
         // TODO: claimable_ovlの計算
         let curr_amount = u64::from(stake.amount);
 
-        ensure!(curr_amount as i128 - u64::from(*amount) as i128 >= 0, ContractError::InsufficientOvl);
+        ensure!(curr_amount >= u64::from(*amount), ContractError::InsufficientOvl);
 
         let after_amount = curr_amount - u64::from(*amount);
         let tier_bases = &self.tier_bases;
@@ -269,8 +269,8 @@ impl<S: HasStateApi> State<S> {
 
                 let ovl_credit_amount = ovl_credit_str.parse::<u64>().unwrap();
 
-                ensure!(ovl_credit_amount as i128 - staked_ovl_credit as i128 >= 0, ContractError::InsufficientOvlCredit);
-                stake.amount = TokenAmountU64::from(after_amount);
+                ensure!(ovl_credit_amount >= staked_ovl_credit, ContractError::InsufficientOvlCredit);
+                stake.amount = after_amount.into();
                 stake.start_at = *start_at;
                 stake.tier = index as u8;
                 stake.ovl_credit_amount = ovl_credit_amount;
@@ -281,11 +281,11 @@ impl<S: HasStateApi> State<S> {
         }
 
         if index == 0 {
-            ensure!(stake.available_ovl_credit_amount as i128 - staked_ovl_credit as i128 >= 0, ContractError::InsufficientOvlCredit);
-            stake.amount = TokenAmountU64::from(after_amount);
+            ensure!(after_amount >= staked_ovl_credit, ContractError::InsufficientOvlCredit);
+            stake.amount = after_amount.into();
             stake.start_at = *start_at;
             stake.tier = 0;
-            stake.ovl_credit_amount = stake.amount.into();
+            stake.ovl_credit_amount = after_amount.into();
             stake.available_ovl_credit_amount = stake.ovl_credit_amount - staked_ovl_credit;
         }
 
