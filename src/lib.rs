@@ -89,6 +89,12 @@ struct TransferFromParams {
 }
 
 #[derive(Debug, Serialize, SchemaType)]
+struct DepositOvlCreditParams {
+    project_address: ProjectAddress,
+    ovl_credit_amount: OvlCreditAmount,
+}
+
+#[derive(Debug, Serialize, SchemaType)]
 struct ViewStakeParams {
     owner: Address,
 }
@@ -292,6 +298,23 @@ impl<S: HasStateApi> State<S> {
         Ok(())
     }
 
+    fn deposit_ovl_credit(
+        &mut self,
+        owner: &Address,
+        project_address: ProjectAddress,
+        ovl_credit_amount: &OvlCreditAmount,
+        state_builder: &mut StateBuilder<S>,
+    ) -> ContractResult<()> {
+        let mut stake = self.stakes.entry(*owner).or_insert_with(|| StakeState::new(Timestamp::from_timestamp_millis(0), state_builder));
+
+        ensure!(stake.available_ovl_credit_amount >= *ovl_credit_amount, ContractError::InsufficientOvlCredit);
+
+        stake.staked_ovl_credits.entry(project_address).or_insert_with(|| *ovl_credit_amount);
+        stake.available_ovl_credit_amount -= ovl_credit_amount;
+
+        Ok(())
+    }
+
     fn get_staked_ovl_credits(&self, owner: &Address) -> Vec<(ProjectAddress, OvlCreditAmount)> {
         let stake_state = match self.stakes.get(owner) {
             Some(v) => v,
@@ -459,6 +482,28 @@ fn contract_unstake<S: HasStateApi>(
         EntrypointName::new_unchecked("transfer"),
         Amount::zero()
     )?;
+
+    Ok(())
+}
+
+#[receive(
+    contract = "ovl_staking",
+    name = "depositOvlCredit",
+    parameter = "DepositOvlCreditParams",
+    error = "ContractError",
+    mutable
+)]
+fn contract_deposit_ovl_credit<S: HasStateApi>(
+    ctx: &impl HasReceiveContext,
+    host: &mut impl HasHost<State<S>, StateApiType = S>,
+) -> ContractResult<()> {
+    ensure!(!host.state().paused, ContractError::ContractPaused);
+
+    let params: DepositOvlCreditParams = ctx.parameter_cursor().get()?;
+    let sender = ctx.sender();
+
+    let (state, builder) = host.state_and_builder();
+    state.deposit_ovl_credit(&sender, params.project_address, &params.ovl_credit_amount, builder)?;
 
     Ok(())
 }
