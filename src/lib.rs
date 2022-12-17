@@ -19,8 +19,6 @@ struct TierBaseState {
     max_alloc: u64,
     // OVL Creditの計算倍率
     rate: u64,
-    // TierのOVL Creditの総量
-    ovl_credit_amount: OvlCreditAmount
 }
 
 #[derive(Debug, Serial, DeserialWithState, Deletable, StateClone)]
@@ -113,7 +111,6 @@ struct ViewTierBaseParams {
     threshold: Threshold,
     max_alloc: u64,
     rate: u64,
-    ovl_credit_amount: OvlCreditAmount
 }
 
 type ViewTierBasesResponse = Vec<(u8, ViewTierBaseParams)>;
@@ -389,7 +386,6 @@ fn contract_init<S: HasStateApi>(
         tier_bases.entry(threshold).or_insert_with(|| TierBaseState {
             max_alloc: max_alloc,
             rate: rate,
-            ovl_credit_amount: 0u64.into(),
         });
     }
 
@@ -431,7 +427,6 @@ fn contract_update_tier_base<S: HasStateApi>(
         state.tier_bases.entry(threshold).or_insert_with(|| TierBaseState {
             max_alloc: max_alloc,
             rate: rate,
-            ovl_credit_amount: 0u64.into(),
         });
     }
 
@@ -625,7 +620,6 @@ fn contract_view_tier_bases<S: HasStateApi>(
                 threshold: *threshold,
                 max_alloc: tier_base.max_alloc,
                 rate: tier_base.rate,
-                ovl_credit_amount: tier_base.ovl_credit_amount
             }
         ));
         index += 1;
@@ -698,31 +692,26 @@ mod tests {
         let tier1 = TierBaseState {
             max_alloc: 2,
             rate: 105,
-            ovl_credit_amount: 0u64.into(),
         };
 
         let tier2 = TierBaseState {
             max_alloc: 4,
             rate: 110,
-            ovl_credit_amount: 0u64.into(),
         };
 
         let tier3 = TierBaseState {
             max_alloc: 8,
             rate: 115,
-            ovl_credit_amount: 0u64.into(),
         };
 
         let tier4 = TierBaseState {
             max_alloc: 16,
             rate: 120,
-            ovl_credit_amount: 0u64.into(),
         };
 
         let tier5 = TierBaseState {
             max_alloc: 32,
             rate: 125,
-            ovl_credit_amount: 0u64.into(),
         };
 
         let tier_bases = collections::BTreeMap::from([
