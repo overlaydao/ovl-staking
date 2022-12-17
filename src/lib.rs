@@ -330,8 +330,9 @@ impl<S: HasStateApi> State<S> {
 
         ensure!(stake.available_ovl_credit_amount >= *ovl_credit_amount, ContractError::InsufficientOvlCredit);
 
-        stake.staked_ovl_credits.entry(project_address).or_insert_with(|| *ovl_credit_amount);
         stake.available_ovl_credit_amount -= ovl_credit_amount;
+        let mut staked_ovl_credit = stake.staked_ovl_credits.entry(project_address).or_insert_with(|| 0u64 );
+        *staked_ovl_credit += *ovl_credit_amount;
 
         Ok(())
     }
@@ -342,10 +343,13 @@ impl<S: HasStateApi> State<S> {
         project_address: ProjectAddress,
         ovl_credit_amount: &OvlCreditAmount,
     ) -> ContractResult<()> {
-        let stake = self.stakes.get_mut(owner).ok_or(ContractError::ProjectNotFound)?;
-        let mut staked_ovl_credit = stake.staked_ovl_credits.get_mut(&project_address).ok_or(ContractError::ProjectNotFound)?;
+        let mut stake = self.stakes.get_mut(owner).ok_or(ContractError::ProjectNotFound)?;
+        let staked_ovl_credit = stake.staked_ovl_credits.get(&project_address).ok_or(ContractError::ProjectNotFound)?;
+
         ensure!(*staked_ovl_credit >= *ovl_credit_amount, ContractError::InsufficientDepositedOvlCredit);
-        *staked_ovl_credit -= ovl_credit_amount;
+
+        stake.available_ovl_credit_amount += ovl_credit_amount;
+        *stake.staked_ovl_credits.get_mut(&project_address).unwrap() -= ovl_credit_amount;
 
         Ok(())
     }
@@ -366,14 +370,11 @@ impl<S: HasStateApi> State<S> {
 /// Init function that creates a new contract.
 #[init(
     contract = "ovl_staking",
-    // enable_logger,
     parameter = "InitParams",
-    // event = "Event"
 )]
 fn contract_init<S: HasStateApi>(
     ctx: &impl HasInitContext,
     state_builder: &mut StateBuilder<S>,
-    // logger: &mut impl HasLogger,
 ) -> InitResult<State<S>> {
     let params: InitParams = ctx.parameter_cursor().get()?;
 
@@ -407,13 +408,11 @@ fn contract_init<S: HasStateApi>(
     contract = "ovl_staking",
     name = "updateTierBase",
     parameter = "UpdateTierBaseParams",
-    // enable_logger,
     mutable
 )]
 fn contract_update_tier_base<S: HasStateApi>(
     ctx: &impl HasReceiveContext,
     host: &mut impl HasHost<State<S>, StateApiType = S>,
-    // logger: &mut impl HasLogger,
 ) -> ContractResult<()> {
     ensure_eq!(ctx.sender(), host.state().admin, ContractError::Unauthorized);
 
@@ -457,7 +456,6 @@ fn contract_stake<S: HasStateApi>(
     let params: StakeParams = ctx.parameter_cursor().get()?;
     let sender = ctx.sender();
 
-    // transferできたらstakeの実行をする
     let transfer = Transfer {
         token_id: TOKEN_ID_OVL,
         amount: params.amount,
@@ -827,14 +825,16 @@ mod tests {
 
         let _logger = TestLogger::init();
         let mut state_builder = TestStateBuilder::new();
-        let state = initial_state(&mut state_builder);
+        let mut state = initial_state(&mut state_builder);
+        state.stake(&ADMIN_ADDRESS, &TokenAmountU64::from(500), &ctx.metadata().slot_time(), &mut state_builder);
         let mut host = TestHost::new(state, state_builder);
 
-        let result: ContractResult<()> = contract_stake(&ctx, &mut host);
-        println!("{:?}", result);
+        // TODO: need contract mock
+        // let result: ContractResult<()> = contract_stake(&ctx, &mut host);
+        // println!("{:?}", result);
 
-        // Check the result.
-        claim!(result.is_ok(), "Results in rejection");
+        // // Check the result.
+        // claim!(result.is_ok(), "Results in rejection");
 
         let params2 = ViewStakeParams {
             owner:   ADMIN_ADDRESS
@@ -856,47 +856,26 @@ mod tests {
 
         ctx.metadata_mut().set_slot_time(Timestamp::from_timestamp_millis(100));
 
-        // Set up the parameter.
-        let params = StakeParams {
-            amount:   ContractTokenAmount::from(5000),
+        let _logger = TestLogger::init();
+        let mut state_builder = TestStateBuilder::new();
+        let mut state = initial_state(&mut state_builder);
+
+        // first stake
+        state.stake(&ADMIN_ADDRESS, &ContractTokenAmount::from(5000), &ctx.metadata().slot_time(), &mut state_builder);
+
+        // first unstake
+        let unstake_result = state.unstake(&ADMIN_ADDRESS,  &ContractTokenAmount::from(1000), &ctx.metadata().slot_time());
+        println!("{:?}", unstake_result);
+
+        let mut host = TestHost::new(state, state_builder);
+
+        let params = ViewStakeParams {
+            owner: ADMIN_ADDRESS
         };
         let parameter_bytes = to_bytes(&params);
         ctx.set_parameter(&parameter_bytes);
-
-        let _logger = TestLogger::init();
-        let mut state_builder = TestStateBuilder::new();
-        let state = initial_state(&mut state_builder);
-        let mut host = TestHost::new(state, state_builder);
-
-        let result: ContractResult<()> = contract_stake(&ctx, &mut host);
-        // println!("{:?}", result);
-
-        // Check the result.
-        claim!(result.is_ok(), "Results in rejection");
-
-        let params2 = ViewStakeParams {
-            owner:   ADMIN_ADDRESS
-        };
-        let parameter_bytes2 = to_bytes(&params2);
-        ctx.set_parameter(&parameter_bytes2);
-        let result2: ContractResult<ViewStakeResponse> = contract_view_stake(&ctx, &mut host);
-        // println!("{:?}", result2);
-        claim!(result2.is_ok(), "Results in rejection");
-
-        let params3 = UnstakeParams {
-            amount:   ContractTokenAmount::from(1000),
-        };
-        let parameter_bytes3 = to_bytes(&params3);
-        ctx.set_parameter(&parameter_bytes3);
-        let result3: ContractResult<()> = contract_unstake(&ctx, &mut host);
-        // println!("{:?}", result3);
-        claim!(result3.is_ok(), "Results in rejection");
-
-        let parameter_bytes2 = to_bytes(&params2);
-        ctx.set_parameter(&parameter_bytes2);
-        let result4: ContractResult<ViewStakeResponse> = contract_view_stake(&ctx, &mut host);
-        println!("{:?}", result4);
-
+        let result: ContractResult<ViewStakeResponse> = contract_view_stake(&ctx, &mut host);
+        println!("{:?}", result);
     }
 
     #[concordium_test]
@@ -910,90 +889,45 @@ mod tests {
 
         ctx.metadata_mut().set_slot_time(Timestamp::from_timestamp_millis(100));
 
-        // Set up the parameter.
-        let params = StakeParams {
-            amount:   ContractTokenAmount::from(1000),
-        };
-        let parameter_bytes = to_bytes(&params);
-        ctx.set_parameter(&parameter_bytes);
-
         let _logger = TestLogger::init();
         let mut state_builder = TestStateBuilder::new();
-        let state = initial_state(&mut state_builder);
+        let mut state = initial_state(&mut state_builder);
+
+        // first stake
+        state.stake(&ADMIN_ADDRESS, &ContractTokenAmount::from(5000), &ctx.metadata().slot_time(), &mut state_builder);
+
+        // first unstake
+        // let unstake_result = state.unstake(&ADMIN_ADDRESS,  &ContractTokenAmount::from(1000), &ctx.metadata().slot_time());
+        // println!("{:?}", unstake_result);
+
         let mut host = TestHost::new(state, state_builder);
 
-        let result: ContractResult<()> = contract_stake(&ctx, &mut host);
-        println!("{:?}", result);
-
-        // Check the result.
-        claim!(result.is_ok(), "Results in rejection");
-
-        let params2 = ViewStakeParams {
-            owner:   ADMIN_ADDRESS
-        };
-        let parameter_bytes2 = to_bytes(&params2);
-        ctx.set_parameter(&parameter_bytes2);
-        let result2: ContractResult<ViewStakeResponse> = contract_view_stake(&ctx, &mut host);
-        println!("{:?}", result2);
-
-        let params3 = DepositOvlCreditParams {
+        let deposit_params = DepositOvlCreditParams {
             project_address:  ContractAddress::new(2250, 0),
-            ovl_credit_amount: 1000,
+            ovl_credit_amount: 2000,
         };
+        let deposit_parameter_bytes = to_bytes(&deposit_params);
+        ctx.set_parameter(&deposit_parameter_bytes);
+        let deposit_result: ContractResult<()> = contract_deposit_ovl_credit(&ctx, &mut host);
+        println!("{:?}", deposit_result);
 
-        let parameter_bytes3 = to_bytes(&params3);
-        ctx.set_parameter(&parameter_bytes3);
-        let result3: ContractResult<()> = contract_deposit_ovl_credit(&ctx, &mut host);
-        println!("{:?}", result);
-
-        claim!(result3.is_ok(), "Results in rejection");
-
-        let parameter_bytes2 = to_bytes(&params2);
-        ctx.set_parameter(&parameter_bytes2);
-        let result4: ContractResult<ViewStakeResponse> = contract_view_stake(&ctx, &mut host);
-        println!("{:?}", result4);
-
-        let params5 = DepositOvlCreditParams {
+        let withdraw_params = DepositOvlCreditParams {
             project_address:  ContractAddress::new(2250, 0),
-            ovl_credit_amount: 1100,
+            ovl_credit_amount: 500,
+        };
+        let withdraw_parameter_bytes = to_bytes(&withdraw_params);
+        ctx.set_parameter(&withdraw_parameter_bytes);
+        let withdraw_result: ContractResult<()> = contract_withdraw_ovl_credit(&ctx, &mut host);
+        println!("{:?}", withdraw_result);
+
+        let view_params = ViewStakeParams {
+            owner: ADMIN_ADDRESS
         };
 
-        let parameter_bytes5 = to_bytes(&params5);
-        ctx.set_parameter(&parameter_bytes5);
-        let result5: ContractResult<()> = contract_withdraw_ovl_credit(&ctx, &mut host);
-        println!("{:?}", result5);
-
-        claim_eq!(
-            result5,
-            Err(ContractError::InsufficientDepositedOvlCredit),
-            "Deposit should fail because deposited ovl credit is insufficient."
-        );
-
-        let params7 = DepositOvlCreditParams {
-            project_address:  ContractAddress::new(404, 0),
-            ovl_credit_amount: 300,
-        };
-
-        let parameter_bytes7 = to_bytes(&params7);
-        ctx.set_parameter(&parameter_bytes7);
-        let result7: ContractResult<()> = contract_withdraw_ovl_credit(&ctx, &mut host);
-        println!("{:?}", result7);
-        claim_eq!(
-            result7,
-            Err(ContractError::ProjectNotFound),
-            "Deposit should fail because project is not found."
-        );
-
-        let params8 = DepositOvlCreditParams {
-            project_address:  ContractAddress::new(2250, 0),
-            ovl_credit_amount: 300,
-        };
-
-        let parameter_bytes8 = to_bytes(&params8);
-        ctx.set_parameter(&parameter_bytes8);
-        let result8: ContractResult<()> = contract_withdraw_ovl_credit(&ctx, &mut host);
-        println!("{:?}", result8);
-        claim!(result8.is_ok(), "Results in rejection");
+        let view_parameter_bytes = to_bytes(&view_params);
+        ctx.set_parameter(&view_parameter_bytes);
+        let view_result: ContractResult<ViewStakeResponse> = contract_view_stake(&ctx, &mut host);
+        println!("{:?}", view_result);
     }
 
     #[concordium_test]
