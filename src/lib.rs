@@ -133,6 +133,11 @@ struct ViewResponse {
     token_address: ContractAddress,
 }
 
+#[derive(Debug, Serialize, SchemaType)]
+struct UpgradeParams {
+    module:  ModuleReference,
+    migrate: Option<(OwnedEntrypointName, OwnedParameter)>,
+}
 
 /// Contract error type
 #[derive(Serialize, Debug, PartialEq, Eq, Reject, SchemaType, EnumIter)]
@@ -667,6 +672,38 @@ fn contract_receive_transfer<S: HasStateApi>(
     _host: &impl HasHost<State<S>, StateApiType = S>,
 ) -> ReceiveResult<OnReceivingCis2Parameter> {
     Ok(ctx.parameter_cursor().get()?)
+}
+
+#[receive(
+    contract = "ovl_staking",
+    name = "upgrade",
+    parameter = "UpgradeParams",
+    error = "ContractError",
+    low_level
+)]
+fn contract_upgrade<S: HasStateApi>(
+    ctx: &impl HasReceiveContext,
+    host: &mut impl HasHost<S>,
+) -> ContractResult<()> {
+    // Read the top-level contract state.
+    let state: State<S> = host.state().read_root()?;
+
+    // Check that only the admin is authorized to upgrade the smart contract.
+    ensure_eq!(ctx.sender(), state.admin, ContractError::Unauthorized);
+    // Parse the parameter.
+    let params: UpgradeParams = ctx.parameter_cursor().get()?;
+    // Trigger the upgrade.
+    host.upgrade(params.module)?;
+    // Call the migration function if provided.
+    if let Some((func, parameters)) = params.migrate {
+        host.invoke_contract_raw(
+            &ctx.self_address(),
+            parameters.as_parameter(),
+            func.as_entrypoint_name(),
+            Amount::zero(),
+        )?;
+    }
+    Ok(())
 }
 
 #[concordium_cfg_test]
