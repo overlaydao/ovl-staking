@@ -613,7 +613,7 @@ fn contract_view<S: HasStateApi>(
 
 #[receive(
     contract = "ovl_staking",
-    name = "ViewTierBases",
+    name = "viewTierBases",
     return_value = "ViewTierBasesResponse",
     error = "ContractError"
 )]
