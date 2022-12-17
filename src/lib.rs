@@ -879,7 +879,7 @@ mod tests {
     }
 
     #[concordium_test]
-    fn test_deposit_ovl_credit() {
+    fn test_deposit_and_withdraw_ovl_credit() {
         // Set up the context
         let mut ctx = TestReceiveContext::empty();
         ctx.set_sender(ADMIN_ADDRESS);
@@ -893,15 +893,12 @@ mod tests {
         let mut state_builder = TestStateBuilder::new();
         let mut state = initial_state(&mut state_builder);
 
-        // first stake
+        // stake
         state.stake(&ADMIN_ADDRESS, &ContractTokenAmount::from(5000), &ctx.metadata().slot_time(), &mut state_builder);
-
-        // first unstake
-        // let unstake_result = state.unstake(&ADMIN_ADDRESS,  &ContractTokenAmount::from(1000), &ctx.metadata().slot_time());
-        // println!("{:?}", unstake_result);
 
         let mut host = TestHost::new(state, state_builder);
 
+        // deposit
         let deposit_params = DepositOvlCreditParams {
             project_address:  ContractAddress::new(2250, 0),
             ovl_credit_amount: 2000,
@@ -911,15 +908,17 @@ mod tests {
         let deposit_result: ContractResult<()> = contract_deposit_ovl_credit(&ctx, &mut host);
         println!("{:?}", deposit_result);
 
+        // withdraw
         let withdraw_params = DepositOvlCreditParams {
             project_address:  ContractAddress::new(2250, 0),
-            ovl_credit_amount: 500,
+            ovl_credit_amount: 1200,
         };
         let withdraw_parameter_bytes = to_bytes(&withdraw_params);
         ctx.set_parameter(&withdraw_parameter_bytes);
         let withdraw_result: ContractResult<()> = contract_withdraw_ovl_credit(&ctx, &mut host);
         println!("{:?}", withdraw_result);
 
+        // view stake
         let view_params = ViewStakeParams {
             owner: ADMIN_ADDRESS
         };
