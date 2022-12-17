@@ -133,6 +133,12 @@ struct ViewResponse {
     token_address: ContractAddress,
 }
 
+#[derive(Serialize, SchemaType)]
+#[repr(transparent)]
+struct SetPausedParams {
+    paused: bool,
+}
+
 #[derive(Debug, Serialize, SchemaType)]
 struct UpgradeParams {
     module:  ModuleReference,
@@ -672,6 +678,26 @@ fn contract_receive_transfer<S: HasStateApi>(
     _host: &impl HasHost<State<S>, StateApiType = S>,
 ) -> ReceiveResult<OnReceivingCis2Parameter> {
     Ok(ctx.parameter_cursor().get()?)
+}
+
+#[receive(
+    contract = "ovl_staking",
+    name = "setPaused",
+    parameter = "SetPausedParams",
+    error = "ContractError",
+    mutable
+)]
+fn contract_set_paused<S: HasStateApi>(
+    ctx: &impl HasReceiveContext,
+    host: &mut impl HasHost<State<S>, StateApiType = S>,
+) -> ContractResult<()> {
+    ensure_eq!(ctx.sender(), host.state().admin, ContractError::Unauthorized);
+
+    let params: SetPausedParams = ctx.parameter_cursor().get()?;
+
+    host.state_mut().paused = params.paused;
+
+    Ok(())
 }
 
 #[receive(
