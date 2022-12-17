@@ -12,6 +12,7 @@ std = ["concordium-std/std", "concordium-cis2/std"]
 [dependencies]
 concordium-cis2 = "2.0.0"
 concordium-std = "5.0.0"
+strum = { version = "0.24.1", features = ["derive"] }
 
 [lib]
 crate-type = ["cdylib", "rlib"]

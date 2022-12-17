@@ -1,6 +1,8 @@
 #![cfg_attr(not(feature = "std"), no_std)]
-use concordium_cis2::{*};
-use concordium_std::{*};
+use concordium_cis2::*;
+use concordium_std::*;
+use strum::IntoEnumIterator;
+use strum::EnumIter;
 
 const TOKEN_ID_OVL: ContractTokenId = TokenIdUnit();
 
@@ -58,6 +60,7 @@ impl<S: HasStateApi> StakeState<S> {
 struct State<S: HasStateApi> {
     admin: Address,
     paused: bool,
+    token_address: ContractAddress,
     tier_bases: collections::BTreeMap<Threshold, TierBaseState>,
     stakes: StateMap<Address, StakeState<S>, S>,
 }
@@ -70,6 +73,12 @@ struct TierBaseParams {
 }
 
 type UpdateTierBaseParams = Vec<TierBaseParams>;
+
+#[derive(Debug, Serialize, SchemaType)]
+struct InitParams {
+    token_address: ContractAddress,
+    tier_bases: UpdateTierBaseParams
+}
 
 #[derive(Debug, Serialize, SchemaType)]
 struct StakeParams {
@@ -120,8 +129,16 @@ struct ViewStakeResponse {
     available_ovl_credit_amount: OvlCreditAmount,
 }
 
+#[derive(Debug, Serialize, SchemaType)]
+struct ViewResponse {
+    admin: Address,
+    paused: bool,
+    token_address: ContractAddress,
+}
+
+
 /// Contract error type
-#[derive(Serialize, Debug, PartialEq, Eq, Reject, SchemaType)]
+#[derive(Serialize, Debug, PartialEq, Eq, Reject, SchemaType, EnumIter)]
 enum ContractError {
     /// Failed parsing the parameter.
     #[from(ParseError)]
@@ -148,6 +165,9 @@ enum ContractError {
     ContractSender,
     InsufficientOvl,
     InsufficientOvlCredit,
+    ProjectNotFound,
+    InsufficientDepositedOvlCredit,
+    StakeOwnerNotFound,
 }
 
 type ContractResult<A> = Result<A, ContractError>;
@@ -188,12 +208,14 @@ impl<S: HasStateApi> State<S> {
     fn new(
         state_builder: &mut StateBuilder<S>,
         admin: Address,
+        token_address: ContractAddress,
         tier_bases: collections::BTreeMap<Threshold, TierBaseState>,
     ) -> Self {
         State {
             admin,
             paused: false,
             stakes: state_builder.new_map(),
+            token_address,
             tier_bases,
         }
     }
@@ -247,9 +269,8 @@ impl<S: HasStateApi> State<S> {
         owner: &Address,
         amount: &ContractTokenAmount,
         start_at: &Timestamp,
-        state_builder: &mut StateBuilder<S>,
     ) -> ContractResult<()> {
-        let mut stake = self.stakes.entry(*owner).or_insert_with(|| StakeState::new(*start_at, state_builder));
+        let mut stake = self.stakes.get_mut(owner).ok_or(ContractError::StakeOwnerNotFound)?;
 
         // TODO: claimable_ovlの計算
         let curr_amount = u64::from(stake.amount);
@@ -315,6 +336,20 @@ impl<S: HasStateApi> State<S> {
         Ok(())
     }
 
+    fn withdraw_ovl_credit(
+        &mut self,
+        owner: &Address,
+        project_address: ProjectAddress,
+        ovl_credit_amount: &OvlCreditAmount,
+    ) -> ContractResult<()> {
+        let stake = self.stakes.get_mut(owner).ok_or(ContractError::ProjectNotFound)?;
+        let mut staked_ovl_credit = stake.staked_ovl_credits.get_mut(&project_address).ok_or(ContractError::ProjectNotFound)?;
+        ensure!(*staked_ovl_credit >= *ovl_credit_amount, ContractError::InsufficientDepositedOvlCredit);
+        *staked_ovl_credit -= ovl_credit_amount;
+
+        Ok(())
+    }
+
     fn get_staked_ovl_credits(&self, owner: &Address) -> Vec<(ProjectAddress, OvlCreditAmount)> {
         let stake_state = match self.stakes.get(owner) {
             Some(v) => v,
@@ -332,7 +367,7 @@ impl<S: HasStateApi> State<S> {
 #[init(
     contract = "ovl_staking",
     // enable_logger,
-    parameter = "UpdateTierBaseParams",
+    parameter = "InitParams",
     // event = "Event"
 )]
 fn contract_init<S: HasStateApi>(
@@ -340,7 +375,7 @@ fn contract_init<S: HasStateApi>(
     state_builder: &mut StateBuilder<S>,
     // logger: &mut impl HasLogger,
 ) -> InitResult<State<S>> {
-    let params: UpdateTierBaseParams = ctx.parameter_cursor().get()?;
+    let params: InitParams = ctx.parameter_cursor().get()?;
 
     let mut tier_bases = collections::BTreeMap::new();
 
@@ -348,7 +383,7 @@ fn contract_init<S: HasStateApi>(
         threshold,
         max_alloc,
         rate
-    } in params
+    } in params.tier_bases
     {
         tier_bases.entry(threshold).or_insert_with(|| TierBaseState {
             max_alloc: max_alloc,
@@ -361,6 +396,7 @@ fn contract_init<S: HasStateApi>(
     let state = State::new(
         state_builder,
         invoker,
+        params.token_address,
         tier_bases,
     );
 
@@ -379,7 +415,6 @@ fn contract_update_tier_base<S: HasStateApi>(
     host: &mut impl HasHost<State<S>, StateApiType = S>,
     // logger: &mut impl HasLogger,
 ) -> ContractResult<()> {
-    ensure!(!host.state().paused, ContractError::ContractPaused);
     ensure_eq!(ctx.sender(), host.state().admin, ContractError::Unauthorized);
 
     let params: UpdateTierBaseParams = ctx.parameter_cursor().get()?;
@@ -432,8 +467,10 @@ fn contract_stake<S: HasStateApi>(
         data: AdditionalData::empty(),
     };
 
+    let token_address = host.state().token_address;
+
     host.invoke_contract(
-        &ContractAddress{index: 2185, subindex: 0},
+        &token_address,
         &TransferParams::from(vec![transfer]),
         EntrypointName::new_unchecked("transferFrom"),
         Amount::zero()
@@ -465,8 +502,8 @@ fn contract_unstake<S: HasStateApi>(
         Address::Contract(_) => return Err(ContractError::Unauthorized),
     };
 
-    let (state, builder) = host.state_and_builder();
-    state.unstake(&ctx.sender(), &params.amount, &ctx.metadata().slot_time(), builder)?;
+    let state = host.state_mut();
+    state.unstake(&ctx.sender(), &params.amount, &ctx.metadata().slot_time())?;
 
     let transfer = Transfer {
         token_id: TOKEN_ID_OVL,
@@ -476,8 +513,10 @@ fn contract_unstake<S: HasStateApi>(
         data: AdditionalData::empty(),
     };
 
+    let token_address = host.state().token_address;
+
     host.invoke_contract(
-        &ContractAddress{index: 2185, subindex: 0},
+        &token_address,
         &TransferParams::from(vec![transfer]),
         EntrypointName::new_unchecked("transfer"),
         Amount::zero()
@@ -510,28 +549,62 @@ fn contract_deposit_ovl_credit<S: HasStateApi>(
 
 #[receive(
     contract = "ovl_staking",
-    name = "viewStake",
-    parameter = "ViewStakeParams",
-    return_value = "ViewStakeResponse",
+    name = "withdrawOvlCredit",
+    parameter = "DepositOvlCreditParams",
+    error = "ContractError",
+    mutable
+)]
+fn contract_withdraw_ovl_credit<S: HasStateApi>(
+    ctx: &impl HasReceiveContext,
+    host: &mut impl HasHost<State<S>, StateApiType = S>,
+) -> ContractResult<()> {
+    ensure!(!host.state().paused, ContractError::ContractPaused);
+
+    let params: DepositOvlCreditParams = ctx.parameter_cursor().get()?;
+    let sender = ctx.sender();
+
+    let state = host.state_mut();
+    state.withdraw_ovl_credit(&sender, params.project_address, &params.ovl_credit_amount)?;
+
+    Ok(())
+}
+
+type ContractErrorParams = Vec<ContractError>;
+
+#[receive(
+    contract = "ovl_staking",
+    name = "viewErrors",
+    return_value = "ContractErrorParams",
     error = "ContractError"
 )]
-fn contract_view_stake<S: HasStateApi>(
-    ctx: &impl HasReceiveContext,
+fn contract_view_errors<S: HasStateApi>(
+    _ctx: &impl HasReceiveContext,
+    _host: &impl HasHost<State<S>, StateApiType = S>,
+) -> ContractResult<ContractErrorParams> {
+    let mut response = vec![];
+    for err in ContractError::iter() {
+        response.push(err);
+    }
+    Ok(response)
+}
+
+#[receive(
+    contract = "ovl_staking",
+    name = "view",
+    return_value = "ViewResponse",
+    error = "ContractError"
+)]
+fn contract_view<S: HasStateApi>(
+    _ctx: &impl HasReceiveContext,
     host: &impl HasHost<State<S>, StateApiType = S>,
-) -> ContractResult<ViewStakeResponse> {
-    let params: ViewStakeParams = ctx.parameter_cursor().get()?;
-    let staked_ovl_credits = host.state().get_staked_ovl_credits(&params.owner);
-    let stake_state = host.state().stakes.get(&params.owner).unwrap();
-    let state = ViewStakeResponse {
-        amount: stake_state.amount,
-        start_at: stake_state.start_at,
-        claimable_ovl: stake_state.claimable_ovl,
-        tier: stake_state.tier,
-        staked_ovl_credits: staked_ovl_credits,
-        ovl_credit_amount: stake_state.ovl_credit_amount,
-        available_ovl_credit_amount: stake_state.available_ovl_credit_amount,
+) -> ContractResult<ViewResponse> {
+    let state = host.state();
+    let response: ViewResponse = ViewResponse {
+        admin: state.admin,
+        paused: state.paused,
+        token_address: state.token_address,
     };
-    Ok(state)
+    Ok(response)
 }
 
 #[receive(
@@ -562,6 +635,32 @@ fn contract_view_tier_bases<S: HasStateApi>(
     Ok(tier_bases_response)
 }
 
+#[receive(
+    contract = "ovl_staking",
+    name = "viewStake",
+    parameter = "ViewStakeParams",
+    return_value = "ViewStakeResponse",
+    error = "ContractError"
+)]
+fn contract_view_stake<S: HasStateApi>(
+    ctx: &impl HasReceiveContext,
+    host: &impl HasHost<State<S>, StateApiType = S>,
+) -> ContractResult<ViewStakeResponse> {
+    let params: ViewStakeParams = ctx.parameter_cursor().get()?;
+    let staked_ovl_credits = host.state().get_staked_ovl_credits(&params.owner);
+    let stake_state = host.state().stakes.get(&params.owner).unwrap();
+    let state = ViewStakeResponse {
+        amount: stake_state.amount,
+        start_at: stake_state.start_at,
+        claimable_ovl: stake_state.claimable_ovl,
+        tier: stake_state.tier,
+        staked_ovl_credits: staked_ovl_credits,
+        ovl_credit_amount: stake_state.ovl_credit_amount,
+        available_ovl_credit_amount: stake_state.available_ovl_credit_amount,
+    };
+    Ok(state)
+}
+
 type OnReceivingCis2Parameter = OnReceivingCis2Params<ContractTokenId, ContractTokenAmount>;
 
 #[receive(
@@ -577,7 +676,6 @@ fn contract_receive_transfer<S: HasStateApi>(
 ) -> ReceiveResult<OnReceivingCis2Parameter> {
     Ok(ctx.parameter_cursor().get()?)
 }
-
 
 #[concordium_cfg_test]
 mod tests {
@@ -636,7 +734,9 @@ mod tests {
             (4000u64, tier4),
             (5000u64, tier5),
         ]);
-        let state = State::new(state_builder, ADMIN_ADDRESS, tier_bases);
+
+        let token_address = ContractAddress::new(2250, 0);
+        let state = State::new(state_builder, ADMIN_ADDRESS, token_address, tier_bases);
         state
     }
     #[concordium_test]
@@ -688,12 +788,32 @@ mod tests {
     }
 
     #[concordium_test]
+    fn test_view() {
+        // Set up the context
+        let mut ctx = TestReceiveContext::empty();
+        ctx.set_sender(ADMIN_ADDRESS);
+
+        let self_address = ContractAddress::new(2250, 0);
+        ctx.set_self_address(self_address);
+
+        let mut state_builder = TestStateBuilder::new();
+        let state = initial_state(&mut state_builder);
+        let mut host = TestHost::new(state, state_builder);
+
+        let result: ContractResult<ViewResponse> = contract_view(&ctx, &mut host);
+        println!("{:?}", result);
+
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
+    }
+
+    #[concordium_test]
     fn test_stake() {
         // Set up the context
         let mut ctx = TestReceiveContext::empty();
         ctx.set_sender(ADMIN_ADDRESS);
 
-        let self_address = ContractAddress::new(2249, 0);
+        let self_address = ContractAddress::new(2250, 0);
         ctx.set_self_address(self_address);
 
         ctx.metadata_mut().set_slot_time(Timestamp::from_timestamp_millis(100));
@@ -731,7 +851,7 @@ mod tests {
         let mut ctx = TestReceiveContext::empty();
         ctx.set_sender(ADMIN_ADDRESS);
 
-        let self_address = ContractAddress::new(2249, 0);
+        let self_address = ContractAddress::new(2250, 0);
         ctx.set_self_address(self_address);
 
         ctx.metadata_mut().set_slot_time(Timestamp::from_timestamp_millis(100));
@@ -749,7 +869,7 @@ mod tests {
         let mut host = TestHost::new(state, state_builder);
 
         let result: ContractResult<()> = contract_stake(&ctx, &mut host);
-        println!("{:?}", result);
+        // println!("{:?}", result);
 
         // Check the result.
         claim!(result.is_ok(), "Results in rejection");
@@ -760,7 +880,8 @@ mod tests {
         let parameter_bytes2 = to_bytes(&params2);
         ctx.set_parameter(&parameter_bytes2);
         let result2: ContractResult<ViewStakeResponse> = contract_view_stake(&ctx, &mut host);
-        println!("{:?}", result2);
+        // println!("{:?}", result2);
+        claim!(result2.is_ok(), "Results in rejection");
 
         let params3 = UnstakeParams {
             amount:   ContractTokenAmount::from(1000),
@@ -768,7 +889,8 @@ mod tests {
         let parameter_bytes3 = to_bytes(&params3);
         ctx.set_parameter(&parameter_bytes3);
         let result3: ContractResult<()> = contract_unstake(&ctx, &mut host);
-        println!("{:?}", result3);
+        // println!("{:?}", result3);
+        claim!(result3.is_ok(), "Results in rejection");
 
         let parameter_bytes2 = to_bytes(&params2);
         ctx.set_parameter(&parameter_bytes2);
@@ -783,7 +905,7 @@ mod tests {
         let mut ctx = TestReceiveContext::empty();
         ctx.set_sender(ADMIN_ADDRESS);
 
-        let self_address = ContractAddress::new(2249, 0);
+        let self_address = ContractAddress::new(2250, 0);
         ctx.set_self_address(self_address);
 
         ctx.metadata_mut().set_slot_time(Timestamp::from_timestamp_millis(100));
@@ -815,7 +937,7 @@ mod tests {
         println!("{:?}", result2);
 
         let params3 = DepositOvlCreditParams {
-            project_address:  ContractAddress::new(2249, 0),
+            project_address:  ContractAddress::new(2250, 0),
             ovl_credit_amount: 1000,
         };
 
@@ -830,6 +952,48 @@ mod tests {
         ctx.set_parameter(&parameter_bytes2);
         let result4: ContractResult<ViewStakeResponse> = contract_view_stake(&ctx, &mut host);
         println!("{:?}", result4);
+
+        let params5 = DepositOvlCreditParams {
+            project_address:  ContractAddress::new(2250, 0),
+            ovl_credit_amount: 1100,
+        };
+
+        let parameter_bytes5 = to_bytes(&params5);
+        ctx.set_parameter(&parameter_bytes5);
+        let result5: ContractResult<()> = contract_withdraw_ovl_credit(&ctx, &mut host);
+        println!("{:?}", result5);
+
+        claim_eq!(
+            result5,
+            Err(ContractError::InsufficientDepositedOvlCredit),
+            "Deposit should fail because deposited ovl credit is insufficient."
+        );
+
+        let params7 = DepositOvlCreditParams {
+            project_address:  ContractAddress::new(404, 0),
+            ovl_credit_amount: 300,
+        };
+
+        let parameter_bytes7 = to_bytes(&params7);
+        ctx.set_parameter(&parameter_bytes7);
+        let result7: ContractResult<()> = contract_withdraw_ovl_credit(&ctx, &mut host);
+        println!("{:?}", result7);
+        claim_eq!(
+            result7,
+            Err(ContractError::ProjectNotFound),
+            "Deposit should fail because project is not found."
+        );
+
+        let params8 = DepositOvlCreditParams {
+            project_address:  ContractAddress::new(2250, 0),
+            ovl_credit_amount: 300,
+        };
+
+        let parameter_bytes8 = to_bytes(&params8);
+        ctx.set_parameter(&parameter_bytes8);
+        let result8: ContractResult<()> = contract_withdraw_ovl_credit(&ctx, &mut host);
+        println!("{:?}", result8);
+        claim!(result8.is_ok(), "Results in rejection");
     }
 
     #[concordium_test]
