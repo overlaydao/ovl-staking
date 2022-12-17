@@ -680,6 +680,34 @@ fn contract_receive_transfer<S: HasStateApi>(
     Ok(ctx.parameter_cursor().get()?)
 }
 
+/// Transfer the admin address to a new admin address.
+///
+/// It rejects if:
+/// - Sender is not the current admin of the contract instance.
+/// - It fails to parse the parameter.
+#[receive(
+    contract = "ovl_staking",
+    name = "updateAdmin",
+    parameter = "Address",
+    error = "ContractError",
+    mutable
+)]
+fn contract_update_admin<S: HasStateApi>(
+    ctx: &impl HasReceiveContext,
+    host: &mut impl HasHost<State<S>, StateApiType = S>,
+) -> ContractResult<()> {
+    // Check that only the current admin is authorized to update the admin address.
+    ensure_eq!(ctx.sender(), host.state().admin, ContractError::Unauthorized);
+
+    // Parse the parameter.
+    let new_admin = ctx.parameter_cursor().get()?;
+
+    // Update the admin variable.
+    host.state_mut().admin = new_admin;
+
+    Ok(())
+}
+
 #[receive(
     contract = "ovl_staking",
     name = "setPaused",
@@ -743,8 +771,8 @@ mod tests {
     // const ADDRESS_1: Address = Address::Account(ACCOUNT_1);
     const ADMIN_ACCOUNT: AccountAddress = AccountAddress([2u8; 32]);
     const ADMIN_ADDRESS: Address = Address::Account(ADMIN_ACCOUNT);
-    // const NEW_ADMIN_ACCOUNT: AccountAddress = AccountAddress([3u8; 32]);
-    // const NEW_ADMIN_ADDRESS: Address = Address::Account(NEW_ADMIN_ACCOUNT);
+    const NEW_ADMIN_ACCOUNT: AccountAddress = AccountAddress([3u8; 32]);
+    const NEW_ADMIN_ADDRESS: Address = Address::Account(NEW_ADMIN_ACCOUNT);
 
     // The metadata url for the wCCD token.
     // const INITIAL_TOKEN_METADATA_URL: &str = "https://some.example/token/wccd";
@@ -875,7 +903,6 @@ mod tests {
         let parameter_bytes = to_bytes(&params);
         ctx.set_parameter(&parameter_bytes);
 
-        let _logger = TestLogger::init();
         let mut state_builder = TestStateBuilder::new();
         let mut state = initial_state(&mut state_builder);
         state.stake(&ADMIN_ADDRESS, &TokenAmountU64::from(500), &ctx.metadata().slot_time(), &mut state_builder);
@@ -908,7 +935,6 @@ mod tests {
 
         ctx.metadata_mut().set_slot_time(Timestamp::from_timestamp_millis(100));
 
-        let _logger = TestLogger::init();
         let mut state_builder = TestStateBuilder::new();
         let mut state = initial_state(&mut state_builder);
 
@@ -941,7 +967,6 @@ mod tests {
 
         ctx.metadata_mut().set_slot_time(Timestamp::from_timestamp_millis(100));
 
-        let _logger = TestLogger::init();
         let mut state_builder = TestStateBuilder::new();
         let mut state = initial_state(&mut state_builder);
 
@@ -979,6 +1004,35 @@ mod tests {
         ctx.set_parameter(&view_parameter_bytes);
         let view_result: ContractResult<ViewStakeResponse> = contract_view_stake(&ctx, &mut host);
         println!("{:?}", view_result);
+    }
+
+        /// Test admin can update to a new admin address.
+    #[concordium_test]
+    fn test_update_admin() {
+        // Set up the context
+        let mut ctx = TestReceiveContext::empty();
+        ctx.set_sender(ADMIN_ADDRESS);
+
+        // Set up the parameter.
+        let parameter_bytes = to_bytes(&[NEW_ADMIN_ADDRESS]);
+        ctx.set_parameter(&parameter_bytes);
+
+        // Set up the state and host.
+        let mut state_builder = TestStateBuilder::new();
+        let state = initial_state(&mut state_builder);
+        let mut host = TestHost::new(state, state_builder);
+
+        // Check the admin state.
+        claim_eq!(host.state().admin, ADMIN_ADDRESS, "Admin should be the old admin address");
+
+        // Call the contract function.
+        let result: ContractResult<()> = contract_update_admin(&ctx, &mut host);
+
+        // Check the result.
+        claim!(result.is_ok(), "Results in rejection");
+
+        // Check the admin state.
+        claim_eq!(host.state().admin, NEW_ADMIN_ADDRESS, "Admin should be the new admin address");
     }
 
     #[concordium_test]
@@ -1022,7 +1076,6 @@ mod tests {
         let parameter_bytes = to_bytes(&params);
         ctx.set_parameter(&parameter_bytes);
 
-        let _logger = TestLogger::init();
         let mut state_builder = TestStateBuilder::new();
         let state = initial_state(&mut state_builder);
         let mut host = TestHost::new(state, state_builder);
