@@ -543,7 +543,7 @@ fn contract_deposit_ovl_credit<S: HasStateApi>(
     ensure!(!host.state().paused, ContractError::ContractPaused);
 
     let params: DepositOvlCreditParams = ctx.parameter_cursor().get()?;
-    let sender = ctx.sender();
+    let sender = Address::from(ctx.invoker());
 
     let (state, builder) = host.state_and_builder();
     state.deposit_ovl_credit(&sender, params.project_address, &params.ovl_credit_amount, builder)?;
@@ -565,7 +565,7 @@ fn contract_withdraw_ovl_credit<S: HasStateApi>(
     ensure!(!host.state().paused, ContractError::ContractPaused);
 
     let params: DepositOvlCreditParams = ctx.parameter_cursor().get()?;
-    let sender = ctx.sender();
+    let sender = Address::from(ctx.invoker());
 
     let state = host.state_mut();
     state.withdraw_ovl_credit(&sender, params.project_address, &params.ovl_credit_amount)?;
