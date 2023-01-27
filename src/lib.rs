@@ -22,16 +22,24 @@ struct TierBaseState {
     rate: u64,
 }
 
-#[derive(Debug, Serialize, SchemaType)]
+#[derive(Debug, Serialize, SchemaType, Clone)]
 struct LockState {
     // ステーキングされているOVLの量
     amount: OvlAmount,
     // ステーキング期間(日数)
     duration: u16,
-    // 倍率(10000分率)
-    ratio: u16,
-    // ロック期間終了後にClaimされたOVLの量
-    claimed_ovl: OvlAmount,
+    // 報酬倍率(10000分率)
+    bonus_rate: u16,
+}
+
+impl LockState {
+    fn new(amount: OvlAmount, duration: u16, bonus_rate: u16) -> Self {
+        LockState {
+            amount: amount,
+            duration: duration,
+            bonus_rate: bonus_rate,
+        }
+    }
 }
 
 #[derive(Debug, Serial, DeserialWithState, Deletable, StateClone)]
@@ -47,8 +55,8 @@ struct StakeState<S> {
     ovl_credit_amount: OvlCreditAmount,
     // 利用できるOVL Creditの総量
     available_ovl_credit_amount: OvlCreditAmount,
-    // ロック
-    locks: StateMap<Timestamp, LockState, S>,
+    // ロックの一覧
+    locks: collections::BTreeMap<Timestamp, LockState>,
 }
 
 impl<S: HasStateApi> StakeState<S> {
@@ -59,7 +67,7 @@ impl<S: HasStateApi> StakeState<S> {
             staked_ovl_credits: state_builder.new_map(),
             ovl_credit_amount: 0u64.into(),
             available_ovl_credit_amount: 0u64.into(),
-            locks: state_builder.new_map(),
+            locks: collections::BTreeMap::new(),
         }
     }
 }
@@ -133,6 +141,7 @@ struct ViewStakeResponse {
     staked_ovl_credits: Vec<(ProjectAddress, OvlCreditAmount)>,
     ovl_credit_amount: OvlCreditAmount,
     available_ovl_credit_amount: OvlCreditAmount,
+    locks: collections::BTreeMap<Timestamp, LockState>,
 }
 
 #[derive(Debug, Serialize, SchemaType)]
@@ -652,6 +661,7 @@ fn contract_view_stake<S: HasStateApi>(
         staked_ovl_credits: staked_ovl_credits,
         ovl_credit_amount: stake_state.ovl_credit_amount,
         available_ovl_credit_amount: stake_state.available_ovl_credit_amount,
+        locks: stake_state.locks.clone()
     };
     Ok(state)
 }
