@@ -104,7 +104,7 @@ struct StakeParams {
 
 #[derive(Debug, Serialize, SchemaType)]
 struct UnstakeParams {
-    amount: OvlAmount,
+    start_at: Timestamp
 }
 
 #[derive(Debug, Serialize, SchemaType)]
@@ -195,6 +195,7 @@ enum ContractError {
     InsufficientDepositedOvlCredit,
     StakeOwnerNotFound,
     InvalidSender,
+    LockNotFound,
 }
 
 type ContractResult<A> = Result<A, ContractError>;
@@ -251,11 +252,13 @@ impl<S: HasStateApi> State<S> {
         &mut self,
         owner: &Address,
         amount: &ContractTokenAmount,
+        start_at: &Timestamp,
         state_builder: &mut StateBuilder<S>,
     ) {
         let mut stake = self.stakes.entry(*owner).or_insert_with(|| StakeState::new(state_builder));
 
-        // TODO: claimable_ovlの計算
+        // TODO: durationと倍率を入れる。
+        let lock_state = LockState::new(*amount, 30, 50);
         stake.amount += *amount;
 
         let tier_bases = &self.tier_bases;
@@ -277,6 +280,7 @@ impl<S: HasStateApi> State<S> {
                 stake.tier = index as u8;
                 stake.ovl_credit_amount = ovl_credit_str.parse::<u64>().unwrap();
                 stake.available_ovl_credit_amount = stake.ovl_credit_amount - staked_ovl_credit;
+                stake.locks.insert(*start_at, lock_state);
                 break;
             }
             index -= 1;
@@ -292,16 +296,17 @@ impl<S: HasStateApi> State<S> {
     fn unstake(
         &mut self,
         owner: &Address,
-        amount: &ContractTokenAmount,
+        start_at: &Timestamp,
     ) -> ContractResult<()> {
         let mut stake = self.stakes.get_mut(owner).ok_or(ContractError::StakeOwnerNotFound)?;
+        let lock_state = stake.locks.get(start_at).ok_or(ContractError::LockNotFound)?;
 
-        // TODO: claimable_ovlの計算
         let curr_amount = u64::from(stake.amount);
 
-        ensure!(curr_amount >= u64::from(*amount), ContractError::InsufficientOvl);
+        ensure!(curr_amount >= u64::from(lock_state.amount), ContractError::InsufficientOvl);
 
-        let after_amount = curr_amount - u64::from(*amount);
+        let after_amount = curr_amount - u64::from(lock_state.amount);
+
         let tier_bases = &self.tier_bases;
         let mut index = tier_bases.len();
 
@@ -325,6 +330,7 @@ impl<S: HasStateApi> State<S> {
                 stake.tier = index as u8;
                 stake.ovl_credit_amount = ovl_credit_amount;
                 stake.available_ovl_credit_amount = ovl_credit_amount - staked_ovl_credit;
+                stake.locks.remove(start_at);
                 break;
             }
             index -= 1;
@@ -336,6 +342,7 @@ impl<S: HasStateApi> State<S> {
             stake.tier = 0;
             stake.ovl_credit_amount = after_amount.into();
             stake.available_ovl_credit_amount = stake.ovl_credit_amount - staked_ovl_credit;
+            stake.locks.remove(start_at);
         }
 
         Ok(())
@@ -484,7 +491,7 @@ fn contract_stake<S: HasStateApi>(
     let params: OnReceivingCis2Parameter = ctx.parameter_cursor().get()?;
 
     let (state, builder) = host.state_and_builder();
-    state.stake(&params.from, &params.amount, builder);
+    state.stake(&params.from, &params.amount, &ctx.metadata().slot_time(), builder);
 
     Ok(())
 }
@@ -510,11 +517,17 @@ fn contract_unstake<S: HasStateApi>(
     };
 
     let state = host.state_mut();
-    state.unstake(&ctx.sender(), &params.amount)?;
+    state.unstake(&ctx.sender(), &params.start_at)?;
+
+    // TODO: claimed_amountの計算
+    // 期間を調べる。
+    // 超えてたらbonusを計算して送る。
+    // 超えてなかったらearly feeをovl_safeに送り、それ以外をユーザーに返す。
+    let claimed_amount: OvlAmount = 0u64.into();
 
     let transfer = Transfer {
         token_id: TOKEN_ID_OVL,
-        amount: params.amount,
+        amount: claimed_amount,
         from: Address::Contract(ctx.self_address()),
         to: Receiver::Account(sender),
         data: AdditionalData::empty(),
@@ -905,7 +918,7 @@ mod tests {
 
         let mut state_builder = TestStateBuilder::new();
         let mut state = initial_state(&mut state_builder);
-        state.stake(&ADMIN_ADDRESS, &TokenAmountU64::from(500), &mut state_builder);
+        state.stake(&ADMIN_ADDRESS, &TokenAmountU64::from(500), &ctx.metadata().slot_time(), &mut state_builder);
         let mut host = TestHost::new(state, state_builder);
 
         // TODO: need contract mock
@@ -939,10 +952,10 @@ mod tests {
         let mut state = initial_state(&mut state_builder);
 
         // first stake
-        state.stake(&ADMIN_ADDRESS, &ContractTokenAmount::from(5000), &mut state_builder);
+        state.stake(&ADMIN_ADDRESS, &ContractTokenAmount::from(5000), &ctx.metadata().slot_time(), &mut state_builder);
 
         // first unstake
-        let unstake_result = state.unstake(&ADMIN_ADDRESS,  &ContractTokenAmount::from(1000));
+        let unstake_result = state.unstake(&ADMIN_ADDRESS, &ctx.metadata().slot_time());
         println!("{:?}", unstake_result);
 
         let mut host = TestHost::new(state, state_builder);
@@ -971,7 +984,7 @@ mod tests {
         let mut state = initial_state(&mut state_builder);
 
         // stake
-        state.stake(&ADMIN_ADDRESS, &ContractTokenAmount::from(5000), &mut state_builder);
+        state.stake(&ADMIN_ADDRESS, &ContractTokenAmount::from(5000), &ctx.metadata().slot_time(), &mut state_builder);
 
         let mut host = TestHost::new(state, state_builder);
 
