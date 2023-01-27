@@ -177,6 +177,7 @@ enum ContractError {
     ProjectNotFound,
     InsufficientDepositedOvlCredit,
     StakeOwnerNotFound,
+    InvalidSender,
 }
 
 type ContractResult<A> = Result<A, ContractError>;
@@ -459,6 +460,14 @@ fn contract_stake<S: HasStateApi>(
     host: &mut impl HasHost<State<S>, StateApiType = S>,
 ) -> ContractResult<()> {
     ensure!(!host.state().paused, ContractError::ContractPaused);
+
+    // Sender must be contract address of token.
+    let sender = match ctx.sender() {
+        Address::Account(_) => return Err(ContractError::InvalidSender),
+        Address::Contract(sender) => sender,
+    };
+
+    ensure!(host.state().token_address == sender, ContractError::InvalidSender);
 
     let params: OnReceivingCis2Parameter = ctx.parameter_cursor().get()?;
 
