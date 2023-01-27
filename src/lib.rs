@@ -12,6 +12,7 @@ type OvlAmount = TokenAmountU64;
 type ProjectAddress = ContractAddress;
 type Threshold = u64;
 type ContractTokenAmount = TokenAmountU64;
+type OnReceivingCis2Parameter = OnReceivingCis2Params<ContractTokenId, ContractTokenAmount>;
 
 #[derive(Debug, Serialize, SchemaType, Clone)]
 struct TierBaseState {
@@ -449,7 +450,7 @@ fn contract_update_tier_base<S: HasStateApi>(
 #[receive(
     contract = "ovl_staking",
     name = "stake",
-    parameter = "StakeParams",
+    parameter = "OnReceivingCis2Parameter",
     error = "ContractError",
     mutable
 )]
@@ -459,29 +460,10 @@ fn contract_stake<S: HasStateApi>(
 ) -> ContractResult<()> {
     ensure!(!host.state().paused, ContractError::ContractPaused);
 
-    let params: StakeParams = ctx.parameter_cursor().get()?;
-    let sender = ctx.sender();
-
-    let transfer = Transfer {
-        token_id: TOKEN_ID_OVL,
-        amount: params.amount,
-        from: sender,
-        to: Receiver::Contract(ctx.self_address(),
-                OwnedEntrypointName::new_unchecked("receiveTransfer".to_string())),
-        data: AdditionalData::empty(),
-    };
-
-    let token_address = host.state().token_address;
-
-    host.invoke_contract(
-        &token_address,
-        &TransferParams::from(vec![transfer]),
-        EntrypointName::new_unchecked("transferFrom"),
-        Amount::zero()
-    )?;
+    let params: OnReceivingCis2Parameter = ctx.parameter_cursor().get()?;
 
     let (state, builder) = host.state_and_builder();
-    state.stake(&sender, &params.amount, &ctx.metadata().slot_time(), builder);
+    state.stake(&params.from, &params.amount, &ctx.metadata().slot_time(), builder);
 
     Ok(())
 }
@@ -663,8 +645,6 @@ fn contract_view_stake<S: HasStateApi>(
     };
     Ok(state)
 }
-
-type OnReceivingCis2Parameter = OnReceivingCis2Params<ContractTokenId, ContractTokenAmount>;
 
 #[receive(
     contract = "ovl_staking",
