@@ -5,6 +5,10 @@ use strum::IntoEnumIterator;
 use strum::EnumIter;
 
 const TOKEN_ID_OVL: ContractTokenId = TokenIdUnit();
+const STAKING_BONUS_RATE: u16 = 50;
+const MIN_STAKING_DURATION: u16 = 30;
+const MAX_STAKING_DURATION: u16 = 730;
+
 
 type ContractTokenId = TokenIdUnit;
 type OvlCreditAmount = u64;
@@ -30,14 +34,20 @@ struct LockState {
     duration: u16,
     // 報酬倍率(10000分率)
     bonus_rate: u16,
+    // 開始時間
+    start_at: Timestamp,
+    // 終了時間
+    end_at: Timestamp,
 }
 
 impl LockState {
-    fn new(amount: OvlAmount, duration: u16, bonus_rate: u16) -> Self {
+    fn new(amount: OvlAmount, duration: u16, bonus_rate: u16, start_at: Timestamp, end_at: Timestamp) -> Self {
         LockState {
             amount: amount,
             duration: duration,
             bonus_rate: bonus_rate,
+            start_at: start_at,
+            end_at: end_at,
         }
     }
 }
@@ -97,10 +107,10 @@ struct InitParams {
     tier_bases: UpdateTierBaseParams
 }
 
-#[derive(Debug, Serialize, SchemaType)]
-struct StakeParams {
-    amount: OvlAmount,
-}
+// #[derive(Debug, Serialize, SchemaType)]
+// struct OnReceivingCis2StakeParams {
+//     duration: u16,
+// }
 
 #[derive(Debug, Serialize, SchemaType)]
 struct UnstakeParams {
@@ -196,6 +206,9 @@ enum ContractError {
     StakeOwnerNotFound,
     InvalidSender,
     LockNotFound,
+    InvalidDuration,
+    NotEnoughMinStakingDuration,
+    OverMaxStakingDuration,
 }
 
 type ContractResult<A> = Result<A, ContractError>;
@@ -252,13 +265,20 @@ impl<S: HasStateApi> State<S> {
         &mut self,
         owner: &Address,
         amount: &ContractTokenAmount,
+        duration: u16,
         start_at: &Timestamp,
         state_builder: &mut StateBuilder<S>,
-    ) {
+    ) -> ContractResult<()> {
         let mut stake = self.stakes.entry(*owner).or_insert_with(|| StakeState::new(state_builder));
 
-        // TODO: durationと倍率を入れる。
-        let lock_state = LockState::new(*amount, 30, 50);
+        ensure!(MIN_STAKING_DURATION <= duration, ContractError::NotEnoughMinStakingDuration);
+        ensure!(duration <= MAX_STAKING_DURATION, ContractError::OverMaxStakingDuration);
+
+        let end_at = Timestamp::from(*start_at)
+        .checked_add(Duration::from_days(duration.into()))
+        .ok_or(ContractError::InvalidDuration)?;
+
+        let lock_state = LockState::new(*amount, duration, STAKING_BONUS_RATE, *start_at, end_at);
         stake.amount += *amount;
 
         let tier_bases = &self.tier_bases;
@@ -292,6 +312,8 @@ impl<S: HasStateApi> State<S> {
             stake.available_ovl_credit_amount = stake.ovl_credit_amount - staked_ovl_credit;
             stake.locks.insert(*start_at, lock_state.clone());
         }
+
+        Ok(())
     }
 
     fn unstake(
@@ -490,9 +512,10 @@ fn contract_stake<S: HasStateApi>(
     ensure!(host.state().token_address == sender, ContractError::InvalidSender);
 
     let params: OnReceivingCis2Parameter = ctx.parameter_cursor().get()?;
+    let duration: u16 = from_bytes(params.data.as_ref())?;
 
     let (state, builder) = host.state_and_builder();
-    state.stake(&params.from, &params.amount, &ctx.metadata().slot_time(), builder);
+    state.stake(&params.from, &params.amount, duration, &ctx.metadata().slot_time(), builder)?;
 
     Ok(())
 }
@@ -911,15 +934,15 @@ mod tests {
         ctx.metadata_mut().set_slot_time(Timestamp::from_timestamp_millis(100));
 
         // Set up the parameter.
-        let params = StakeParams {
-            amount:   ContractTokenAmount::from(1000),
-        };
-        let parameter_bytes = to_bytes(&params);
-        ctx.set_parameter(&parameter_bytes);
+        // let params = OnReceivingCis2Parameter {
+        //     duration:  30u16.into(),
+        // };
+        // let parameter_bytes = to_bytes(&params);
+        // ctx.set_parameter(&parameter_bytes);
 
         let mut state_builder = TestStateBuilder::new();
         let mut state = initial_state(&mut state_builder);
-        state.stake(&ADMIN_ADDRESS, &TokenAmountU64::from(500), &ctx.metadata().slot_time(), &mut state_builder);
+        state.stake(&ADMIN_ADDRESS, &TokenAmountU64::from(500), 30u16.into(), &ctx.metadata().slot_time(), &mut state_builder);
         let mut host = TestHost::new(state, state_builder);
 
         // TODO: need contract mock
@@ -953,7 +976,7 @@ mod tests {
         let mut state = initial_state(&mut state_builder);
 
         // first stake
-        state.stake(&ADMIN_ADDRESS, &ContractTokenAmount::from(5000), &ctx.metadata().slot_time(), &mut state_builder);
+        state.stake(&ADMIN_ADDRESS, &TokenAmountU64::from(5000), 30u16.into(), &ctx.metadata().slot_time(), &mut state_builder);
 
         // first unstake
         let unstake_result = state.unstake(&ADMIN_ADDRESS, &ctx.metadata().slot_time());
@@ -985,7 +1008,7 @@ mod tests {
         let mut state = initial_state(&mut state_builder);
 
         // stake
-        state.stake(&ADMIN_ADDRESS, &ContractTokenAmount::from(5000), &ctx.metadata().slot_time(), &mut state_builder);
+        state.stake(&ADMIN_ADDRESS, &TokenAmountU64::from(5000), 30u16.into(), &ctx.metadata().slot_time(), &mut state_builder);
 
         let mut host = TestHost::new(state, state_builder);
 
