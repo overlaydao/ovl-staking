@@ -280,7 +280,7 @@ impl<S: HasStateApi> State<S> {
                 stake.tier = index as u8;
                 stake.ovl_credit_amount = ovl_credit_str.parse::<u64>().unwrap();
                 stake.available_ovl_credit_amount = stake.ovl_credit_amount - staked_ovl_credit;
-                stake.locks.insert(*start_at, lock_state);
+                stake.locks.insert(*start_at, lock_state.clone());
                 break;
             }
             index -= 1;
@@ -290,6 +290,7 @@ impl<S: HasStateApi> State<S> {
             stake.tier = 0;
             stake.ovl_credit_amount = stake.amount.into();
             stake.available_ovl_credit_amount = stake.ovl_credit_amount - staked_ovl_credit;
+            stake.locks.insert(*start_at, lock_state.clone());
         }
     }
 
