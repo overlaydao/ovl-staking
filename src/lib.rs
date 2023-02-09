@@ -122,9 +122,14 @@ struct UnstakeParams {
 }
 
 #[derive(Debug, Serialize, SchemaType)]
-struct ViewStakingRewardParams {
+struct ViewLockStakingRewardParams {
     owner: Address,
     start_at: Timestamp,
+}
+
+#[derive(Debug, Serialize, SchemaType)]
+struct ViewCalcStakingRewardParams {
+    amount: OvlAmount,
     duration: u16,
 }
 
@@ -233,14 +238,13 @@ enum ContractError {
     ProjectNotFound,
     InsufficientDepositedOvlCredit,
     StakeOwnerNotFound,
-    StakeOwnerNotFound2,
-    StakeOwnerNotFound3,
     InvalidSender,
     LockNotFound,
     InvalidDuration,
     NotEnoughMinStakingDuration,
     OverMaxStakingDuration,
     OverflowError,
+    NotEnoughOvlSafe,
 }
 
 type ContractResult<A> = Result<A, ContractError>;
@@ -499,7 +503,7 @@ impl<S: HasStateApi> State<S> {
         return staked_ovl_credits;
     }
 
-    fn calc_staking_reward(
+    fn calc_lock_staking_reward(
         &self,
         owner: &Address,
         start_at: &Timestamp,
@@ -508,7 +512,7 @@ impl<S: HasStateApi> State<S> {
         let stake = self
             .stakes
             .get(owner)
-            .ok_or(ContractError::StakeOwnerNotFound2)?;
+            .ok_or(ContractError::StakeOwnerNotFound)?;
         let lock_state = stake
             .locks
             .get(start_at)
@@ -519,6 +523,46 @@ impl<S: HasStateApi> State<S> {
         let staked_amount: u128 = u64::from(lock_state.amount).into();
         let bonus_rate: u128 = lock_state.bonus_rate.into();
         let staking_days: u128 = staking_days.unwrap_or(lock_state.duration.into());
+
+        let daily_bonus_amount: u128 = (total_ovl_safe_amount)
+            .checked_mul(bonus_rate)
+            .ok_or(ContractError::OverflowError)?;
+        let mut total_bonus_amount = daily_bonus_amount
+            .checked_mul(staking_days)
+            .ok_or(ContractError::OverflowError)?;
+        total_bonus_amount = total_bonus_amount
+            .checked_mul(staked_amount)
+            .ok_or(ContractError::OverflowError)?;
+
+        let mut staking_reward_u128: u128 = total_bonus_amount * (BONUS_DURATION + staking_days);
+        // 大きい数から割り算
+        // 全ユーザーのステーキング総量からに対する割合
+        staking_reward_u128 = staking_reward_u128 / total_staked_amount;
+        // BONUS_RATE_RATIOで割る
+        staking_reward_u128 = staking_reward_u128 / BONUS_RATE_RATIO;
+        // 倍率があがる日数で割る
+        staking_reward_u128 = staking_reward_u128 / BONUS_DURATION;
+
+        // u64の最大値よりも小さい数である必要がある
+        ensure!(
+            staking_reward_u128 <= u128::from(u64::MAX),
+            ContractError::OverflowError
+        );
+        let staking_reward: u64 = staking_reward_u128 as u64;
+
+        Ok(staking_reward)
+    }
+
+    fn calc_staking_reward(
+        &self,
+        amount: OvlAmount,
+        duration: u16,
+    ) -> ContractResult<u64> {
+        let total_ovl_safe_amount: u128 = u64::from(self.ovl_safe_amount).into();
+        let total_staked_amount: u128 = u64::from(self.total_staked_amount + amount).into();
+        let staked_amount: u128 = u64::from(amount).into();
+        let bonus_rate: u128 = BONUS_RATE.into();
+        let staking_days: u128 = duration.into();
 
         let daily_bonus_amount: u128 = (total_ovl_safe_amount)
             .checked_mul(bonus_rate)
@@ -639,12 +683,6 @@ fn contract_deposit_ovl_safe<S: HasStateApi>(
 
     let params: OnReceivingCis2Parameter = ctx.parameter_cursor().get()?;
 
-    ensure_eq!(
-        Address::from(ctx.invoker()),
-        host.state().admin,
-        ContractError::Unauthorized
-    );
-
     ensure!(
         host.state().token_address == sender,
         ContractError::InvalidSender
@@ -680,6 +718,8 @@ fn contract_withdraw_ovl_safe<S: HasStateApi>(
 
     let params: WithdrawOvlSafeParameter = ctx.parameter_cursor().get()?;
     let token_address = host.state().token_address;
+
+    ensure!( params.amount <= host.state().ovl_safe_amount, ContractError::NotEnoughOvlSafe);
 
     let transfer = Transfer {
         token_id: TOKEN_ID_OVL,
@@ -775,7 +815,7 @@ fn contract_unstake<S: HasStateApi>(
 
     let mut staking_reward: u64 =
         host.state()
-            .calc_staking_reward(&ctx.sender(), &params.start_at, None)?;
+            .calc_lock_staking_reward(&ctx.sender(), &params.start_at, None)?;
 
     let mut early_fee: u64 = 0;
 
@@ -787,7 +827,7 @@ fn contract_unstake<S: HasStateApi>(
             early_fee_days = 30
         }
         let left_days = u64::from(lock_state.duration) - staking_days;
-        let raw_early_fee: u64 = host.state().calc_staking_reward(
+        let raw_early_fee: u64 = host.state().calc_lock_staking_reward(
             &ctx.sender(),
             &params.start_at,
             Some(left_days.into()),
@@ -916,22 +956,44 @@ fn contract_view<S: HasStateApi>(
 
 #[receive(
     contract = "ovl_staking",
-    name = "viewStakingReward",
-    parameter = "ViewStakingRewardParams",
+    name = "viewLockStakingReward",
+    parameter = "ViewLockStakingRewardParams",
     return_value = "ViewStakingRewardResponse",
     error = "ContractError"
 )]
-fn contract_view_staking_reward<S: HasStateApi>(
+fn contract_view_lock_staking_reward<S: HasStateApi>(
     ctx: &impl HasReceiveContext,
     host: &impl HasHost<State<S>, StateApiType = S>,
 ) -> ContractResult<ViewStakingRewardResponse> {
     ensure!(!host.state().paused, ContractError::ContractPaused);
 
-    let params: ViewStakingRewardParams = ctx.parameter_cursor().get()?;
-    let staking_reward: u64 = host.state().calc_staking_reward(
+    let params: ViewLockStakingRewardParams = ctx.parameter_cursor().get()?;
+    let staking_reward: u64 = host.state().calc_lock_staking_reward(
         &params.owner,
         &params.start_at,
-        Some(params.duration.into()),
+        None,
+    )?;
+
+    Ok(ViewStakingRewardResponse { staking_reward })
+}
+
+#[receive(
+    contract = "ovl_staking",
+    name = "viewCalcStakingReward",
+    parameter = "ViewCalcStakingRewardParams",
+    return_value = "ViewStakingRewardResponse",
+    error = "ContractError"
+)]
+fn contract_view_calc_staking_reward<S: HasStateApi>(
+    ctx: &impl HasReceiveContext,
+    host: &impl HasHost<State<S>, StateApiType = S>,
+) -> ContractResult<ViewStakingRewardResponse> {
+    ensure!(!host.state().paused, ContractError::ContractPaused);
+
+    let params: ViewCalcStakingRewardParams = ctx.parameter_cursor().get()?;
+    let staking_reward: u64 = host.state().calc_staking_reward(
+        params.amount,
+        params.duration,
     )?;
 
     Ok(ViewStakingRewardResponse { staking_reward })
@@ -971,7 +1033,7 @@ fn contract_view_unstake<S: HasStateApi>(
 
     let mut staking_reward: u64 =
         host.state()
-            .calc_staking_reward(&ctx.sender(), &params.start_at, None)?;
+            .calc_lock_staking_reward(&ctx.sender(), &params.start_at, None)?;
 
     let mut early_fee: u64 = 0;
 
@@ -983,7 +1045,7 @@ fn contract_view_unstake<S: HasStateApi>(
             early_fee_days = 30
         }
         let left_days = u64::from(lock_state.duration) - staking_days;
-        let raw_early_fee: u64 = host.state().calc_staking_reward(
+        let raw_early_fee: u64 = host.state().calc_lock_staking_reward(
             &ctx.sender(),
             &params.start_at,
             Some(left_days.into()),
@@ -1277,7 +1339,7 @@ mod tests {
     }
 
     #[concordium_test]
-    fn test_calc_staking_reward() {
+    fn test_calc_lock_staking_reward() {
         // Set up the context
         let mut ctx = TestReceiveContext::empty();
         ctx.set_sender(ADMIN_ADDRESS);
@@ -1287,13 +1349,6 @@ mod tests {
 
         ctx.metadata_mut()
             .set_slot_time(Timestamp::from_timestamp_millis(100));
-
-        // Set up the parameter.
-        // let params = OnReceivingCis2Parameter {
-        //     duration:  30u16.into(),
-        // };
-        // let parameter_bytes = to_bytes(&params);
-        // ctx.set_parameter(&parameter_bytes);
 
         let mut state_builder = TestStateBuilder::new();
         let mut state = initial_state(&mut state_builder);
@@ -1305,28 +1360,47 @@ mod tests {
             now,
             &mut state_builder,
         );
-
-        // state.stake(
-        //     &ADMIN_ADDRESS,
-        //     &TokenAmountU64::from(32_900_000_000_000),
-        //     60u16.into(),
-        //     &Timestamp::from_timestamp_millis(200),
-        //     &mut state_builder,
-        // );
         println!("{:?}", result1);
         let mut host = TestHost::new(state, state_builder);
 
         host.state_mut().ovl_safe_amount += TokenAmountU64(100000000_000000);
 
-        let params2 = ViewStakingRewardParams {
+        let params2 = ViewLockStakingRewardParams {
             owner: ADMIN_ADDRESS,
             start_at: *now,
-            duration: 30u16
         };
         let parameter_bytes2 = to_bytes(&params2);
         ctx.set_parameter(&parameter_bytes2);
-        let result2: ContractResult<ViewStakingRewardResponse> = contract_view_staking_reward(&ctx, &mut host);
+        let result2: ContractResult<ViewStakingRewardResponse> = contract_view_lock_staking_reward(&ctx, &mut host);
         println!("{:?}", result2);
+    }
+
+        #[concordium_test]
+    fn test_calc_staking_reward() {
+        // Set up the context
+        let mut ctx = TestReceiveContext::empty();
+        ctx.set_sender(ADMIN_ADDRESS);
+
+        let self_address = ContractAddress::new(2250, 0);
+        ctx.set_self_address(self_address);
+
+        ctx.metadata_mut()
+            .set_slot_time(Timestamp::from_timestamp_millis(100));
+
+        let mut state_builder = TestStateBuilder::new();
+        let state = initial_state(&mut state_builder);
+        let mut host = TestHost::new(state, state_builder);
+
+        host.state_mut().ovl_safe_amount += TokenAmountU64(100000000_000000);
+
+        let params1 = ViewCalcStakingRewardParams {
+            amount: TokenAmountU64(33000000_000000),
+            duration: 30u16,
+        };
+        let parameter_bytes1 = to_bytes(&params1);
+        ctx.set_parameter(&parameter_bytes1);
+        let result1: ContractResult<ViewStakingRewardResponse> = contract_view_calc_staking_reward(&ctx, &mut host);
+        println!("{:?}", result1);
     }
 
     #[concordium_test]
