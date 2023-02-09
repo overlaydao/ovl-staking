@@ -123,6 +123,7 @@ struct UnstakeParams {
 
 #[derive(Debug, Serialize, SchemaType)]
 struct ViewStakingRewardParams {
+    owner: Address,
     start_at: Timestamp,
     duration: u16,
 }
@@ -928,7 +929,7 @@ fn contract_view_staking_reward<S: HasStateApi>(
 
     let params: ViewStakingRewardParams = ctx.parameter_cursor().get()?;
     let staking_reward: u64 = host.state().calc_staking_reward(
-        &ctx.sender(),
+        &params.owner,
         &params.start_at,
         Some(params.duration.into()),
     )?;
@@ -1318,6 +1319,7 @@ mod tests {
         host.state_mut().ovl_safe_amount += TokenAmountU64(100000000_000000);
 
         let params2 = ViewStakingRewardParams {
+            owner: ADMIN_ADDRESS,
             start_at: *now,
             duration: 30u16
         };
