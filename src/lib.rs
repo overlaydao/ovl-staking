@@ -232,6 +232,8 @@ enum ContractError {
     ProjectNotFound,
     InsufficientDepositedOvlCredit,
     StakeOwnerNotFound,
+    StakeOwnerNotFound2,
+    StakeOwnerNotFound3,
     InvalidSender,
     LockNotFound,
     InvalidDuration,
@@ -504,33 +506,33 @@ impl<S: HasStateApi> State<S> {
     ) -> ContractResult<u64> {
         let stake = self
             .stakes
-            .get_mut(owner)
-            .ok_or(ContractError::StakeOwnerNotFound)?;
+            .get(owner)
+            .ok_or(ContractError::StakeOwnerNotFound2)?;
         let lock_state = stake
             .locks
             .get(start_at)
             .ok_or(ContractError::LockNotFound)?;
 
         let total_ovl_safe_amount: u128 = u64::from(self.ovl_safe_amount).into();
-        let total_staked_ovl: u128 = u64::from(self.total_staked_amount).into();
+        let total_staked_amount: u128 = u64::from(self.total_staked_amount).into();
         let staked_amount: u128 = u64::from(lock_state.amount).into();
         let bonus_rate: u128 = lock_state.bonus_rate.into();
         let staking_days: u128 = staking_days.unwrap_or(lock_state.duration.into());
 
-        let monthly_base_amount: u128 = (total_ovl_safe_amount)
+        let daily_bonus_amount: u128 = (total_ovl_safe_amount)
             .checked_mul(bonus_rate)
             .ok_or(ContractError::OverflowError)?;
-        let mut bonus_amount = monthly_base_amount
+        let mut total_bonus_amount = daily_bonus_amount
             .checked_mul(staking_days)
             .ok_or(ContractError::OverflowError)?;
-        bonus_amount = bonus_amount
+        total_bonus_amount = total_bonus_amount
             .checked_mul(staked_amount)
             .ok_or(ContractError::OverflowError)?;
 
-        let mut staking_reward_u128: u128 = bonus_amount * (100u128 + staking_days);
+        let mut staking_reward_u128: u128 = total_bonus_amount * (BONUS_DURATION + staking_days);
         // 大きい数から割り算
         // 全ユーザーのステーキング総量からに対する割合
-        staking_reward_u128 = staking_reward_u128 / total_staked_ovl;
+        staking_reward_u128 = staking_reward_u128 / total_staked_amount;
         // BONUS_RATE_RATIOで割る
         staking_reward_u128 = staking_reward_u128 / BONUS_RATE_RATIO;
         // 倍率があがる日数で割る
@@ -727,7 +729,7 @@ fn contract_stake<S: HasStateApi>(
 
     let (state, builder) = host.state_and_builder();
     state.stake(
-        &params.from,
+        &Address::Account(ctx.invoker()),
         &params.amount,
         duration,
         &ctx.metadata().slot_time(),
@@ -1271,6 +1273,58 @@ mod tests {
 
         // Check the result.
         claim!(result.is_ok(), "Results in rejection");
+    }
+
+    #[concordium_test]
+    fn test_calc_staking_reward() {
+        // Set up the context
+        let mut ctx = TestReceiveContext::empty();
+        ctx.set_sender(ADMIN_ADDRESS);
+
+        let self_address = ContractAddress::new(2250, 0);
+        ctx.set_self_address(self_address);
+
+        ctx.metadata_mut()
+            .set_slot_time(Timestamp::from_timestamp_millis(100));
+
+        // Set up the parameter.
+        // let params = OnReceivingCis2Parameter {
+        //     duration:  30u16.into(),
+        // };
+        // let parameter_bytes = to_bytes(&params);
+        // ctx.set_parameter(&parameter_bytes);
+
+        let mut state_builder = TestStateBuilder::new();
+        let mut state = initial_state(&mut state_builder);
+        let now = &Timestamp::from_timestamp_millis(100);
+        let result1 = state.stake(
+            &ADMIN_ADDRESS,
+            &TokenAmountU64::from(33000000_000000),
+            30u16.into(),
+            now,
+            &mut state_builder,
+        );
+
+        // state.stake(
+        //     &ADMIN_ADDRESS,
+        //     &TokenAmountU64::from(32_900_000_000_000),
+        //     60u16.into(),
+        //     &Timestamp::from_timestamp_millis(200),
+        //     &mut state_builder,
+        // );
+        println!("{:?}", result1);
+        let mut host = TestHost::new(state, state_builder);
+
+        host.state_mut().ovl_safe_amount += TokenAmountU64(100000000_000000);
+
+        let params2 = ViewStakingRewardParams {
+            start_at: *now,
+            duration: 30u16
+        };
+        let parameter_bytes2 = to_bytes(&params2);
+        ctx.set_parameter(&parameter_bytes2);
+        let result2: ContractResult<ViewStakingRewardResponse> = contract_view_staking_reward(&ctx, &mut host);
+        println!("{:?}", result2);
     }
 
     #[concordium_test]
