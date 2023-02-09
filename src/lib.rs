@@ -98,7 +98,7 @@ struct State<S: HasStateApi> {
     tier_bases: collections::BTreeMap<Threshold, TierBaseState>,
     stakes: StateMap<Address, StakeState<S>, S>,
     total_staked_amount: OvlAmount,
-    ovlsafe_amount: OvlAmount,
+    ovl_safe_amount: OvlAmount,
 }
 
 #[derive(Debug, Serialize, SchemaType)]
@@ -116,11 +116,6 @@ struct InitParams {
     tier_bases: UpdateTierBaseParams,
 }
 
-// #[derive(Debug, Serialize, SchemaType)]
-// struct OnReceivingCis2StakeParams {
-//     duration: u16,
-// }
-
 #[derive(Debug, Serialize, SchemaType)]
 struct UnstakeParams {
     start_at: Timestamp,
@@ -137,6 +132,11 @@ struct TransferFromParams {
     from: Address,
     to: Receiver,
     amount: ContractTokenAmount,
+}
+
+#[derive(Debug, Serialize, SchemaType)]
+struct WithdrawOvlSafeParameter {
+    amount: OvlAmount,
 }
 
 #[derive(Debug, Serialize, SchemaType)]
@@ -186,7 +186,7 @@ struct ViewResponse {
     paused: bool,
     token_address: ContractAddress,
     total_staked_amount: OvlAmount,
-    ovlsafe_amount: OvlAmount,
+    ovl_safe_amount: OvlAmount,
 }
 
 #[derive(Serialize, SchemaType)]
@@ -292,7 +292,7 @@ impl<S: HasStateApi> State<S> {
             token_address,
             tier_bases,
             total_staked_amount: TokenAmountU64(0),
-            ovlsafe_amount: TokenAmountU64(0),
+            ovl_safe_amount: TokenAmountU64(0),
         }
     }
 
@@ -511,13 +511,13 @@ impl<S: HasStateApi> State<S> {
             .get(start_at)
             .ok_or(ContractError::LockNotFound)?;
 
-        let total_ovlsafe_amount: u128 = u64::from(self.ovlsafe_amount).into();
+        let total_ovl_safe_amount: u128 = u64::from(self.ovl_safe_amount).into();
         let total_staked_ovl: u128 = u64::from(self.total_staked_amount).into();
         let staked_amount: u128 = u64::from(lock_state.amount).into();
         let bonus_rate: u128 = lock_state.bonus_rate.into();
         let staking_days: u128 = staking_days.unwrap_or(lock_state.duration.into());
 
-        let monthly_base_amount: u128 = (total_ovlsafe_amount)
+        let monthly_base_amount: u128 = (total_ovl_safe_amount)
             .checked_mul(bonus_rate)
             .ok_or(ContractError::OverflowError)?;
         let mut bonus_amount = monthly_base_amount
@@ -613,6 +613,87 @@ fn contract_update_tier_base<S: HasStateApi>(
                 rate: rate,
             });
     }
+
+    Ok(())
+}
+
+#[receive(
+    contract = "ovl_staking",
+    name = "depositOvlSafe",
+    parameter = "OnReceivingCis2Parameter",
+    error = "ContractError",
+    mutable
+)]
+fn contract_deposit_ovl_safe<S: HasStateApi>(
+    ctx: &impl HasReceiveContext,
+    host: &mut impl HasHost<State<S>, StateApiType = S>,
+) -> ContractResult<()> {
+    // Sender must be contract address of token.
+    let sender = match ctx.sender() {
+        Address::Account(_) => return Err(ContractError::InvalidSender),
+        Address::Contract(sender) => sender,
+    };
+
+    let params: OnReceivingCis2Parameter = ctx.parameter_cursor().get()?;
+
+    ensure_eq!(
+        Address::from(ctx.invoker()),
+        host.state().admin,
+        ContractError::Unauthorized
+    );
+
+    ensure!(
+        host.state().token_address == sender,
+        ContractError::InvalidSender
+    );
+
+    host.state_mut().ovl_safe_amount += params.amount;
+
+    Ok(())
+}
+
+#[receive(
+    contract = "ovl_staking",
+    name = "withdrawOvlSafe",
+    parameter = "WithdrawOvlSafeParameter",
+    error = "ContractError",
+    mutable
+)]
+fn contract_withdraw_ovl_safe<S: HasStateApi>(
+    ctx: &impl HasReceiveContext,
+    host: &mut impl HasHost<State<S>, StateApiType = S>,
+) -> ContractResult<()> {
+    // Sender must be account address.
+    let sender = match ctx.sender() {
+        Address::Account(sender) => sender,
+        Address::Contract(_) => return Err(ContractError::InvalidSender),
+    };
+
+    ensure_eq!(
+        ctx.sender(),
+        host.state().admin,
+        ContractError::Unauthorized
+    );
+
+    let params: WithdrawOvlSafeParameter = ctx.parameter_cursor().get()?;
+    let token_address = host.state().token_address;
+
+    let transfer = Transfer {
+        token_id: TOKEN_ID_OVL,
+        amount: params.amount,
+        from: Address::Contract(ctx.self_address()),
+        to: Receiver::Account(sender),
+        data: AdditionalData::empty(),
+    };
+
+    host.invoke_contract(
+        &token_address,
+        &TransferParams::from(vec![transfer]),
+        EntrypointName::new_unchecked("transfer"),
+        Amount::zero(),
+    )?;
+
+    host.state_mut().ovl_safe_amount -= params.amount;
 
     Ok(())
 }
@@ -734,8 +815,8 @@ fn contract_unstake<S: HasStateApi>(
     }
 
     let state = host.state_mut();
-    state.ovlsafe_amount -= TokenAmountU64(staking_reward);
-    state.ovlsafe_amount += TokenAmountU64(early_fee);
+    state.ovl_safe_amount -= TokenAmountU64(staking_reward);
+    state.ovl_safe_amount += TokenAmountU64(early_fee);
     state.unstake(&ctx.sender(), &params.start_at)?;
 
     Ok(())
@@ -825,7 +906,7 @@ fn contract_view<S: HasStateApi>(
         paused: state.paused,
         token_address: state.token_address,
         total_staked_amount: state.total_staked_amount,
-        ovlsafe_amount: state.ovlsafe_amount,
+        ovl_safe_amount: state.ovl_safe_amount,
     };
     Ok(response)
 }
