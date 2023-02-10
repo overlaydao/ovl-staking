@@ -795,18 +795,14 @@ fn contract_unstake<S: HasStateApi>(
 
     let params: UnstakeParams = ctx.parameter_cursor().get()?;
 
-    let sender = match ctx.sender() {
-        Address::Account(sender) => sender,
-        Address::Contract(_) => return Err(ContractError::Unauthorized),
-    };
-
     let token_address = host.state().token_address;
     let now = ctx.metadata().slot_time();
 
+    let invoker = &Address::from(ctx.invoker());
     let stake = host
         .state()
         .stakes
-        .get(&ctx.sender())
+        .get(invoker)
         .ok_or(ContractError::StakeOwnerNotFound)?;
     let lock_state = stake
         .locks
@@ -815,7 +811,7 @@ fn contract_unstake<S: HasStateApi>(
 
     let mut staking_reward: u64 =
         host.state()
-            .calc_lock_staking_reward(&ctx.sender(), &params.start_at, None)?;
+            .calc_lock_staking_reward(invoker, &params.start_at, None)?;
 
     let mut early_fee: u64 = 0;
 
@@ -828,7 +824,7 @@ fn contract_unstake<S: HasStateApi>(
         }
         let left_days = u64::from(lock_state.duration) - staking_days;
         let raw_early_fee: u64 = host.state().calc_lock_staking_reward(
-            &ctx.sender(),
+            invoker,
             &params.start_at,
             Some(left_days.into()),
         )?;
@@ -845,7 +841,7 @@ fn contract_unstake<S: HasStateApi>(
             token_id: TOKEN_ID_OVL,
             amount: TokenAmountU64::from(staking_reward),
             from: Address::Contract(ctx.self_address()),
-            to: Receiver::Account(sender),
+            to: Receiver::Account(ctx.invoker()),
             data: AdditionalData::empty(),
         };
 
@@ -860,7 +856,7 @@ fn contract_unstake<S: HasStateApi>(
     let state = host.state_mut();
     state.ovl_safe_amount -= TokenAmountU64(staking_reward);
     state.ovl_safe_amount += TokenAmountU64(early_fee);
-    state.unstake(&ctx.sender(), &params.start_at)?;
+    state.unstake(invoker, &params.start_at)?;
 
     Ok(())
 }
@@ -1014,17 +1010,14 @@ fn contract_view_unstake<S: HasStateApi>(
 
     let params: UnstakeParams = ctx.parameter_cursor().get()?;
 
-    match ctx.sender() {
-        Address::Account(sender) => sender,
-        Address::Contract(_) => return Err(ContractError::Unauthorized),
-    };
+    let sender = &Address::from(ctx.invoker());
 
     let now = ctx.metadata().slot_time();
 
     let stake = host
         .state()
         .stakes
-        .get(&ctx.sender())
+        .get(sender)
         .ok_or(ContractError::StakeOwnerNotFound)?;
     let lock_state = stake
         .locks
@@ -1033,7 +1026,7 @@ fn contract_view_unstake<S: HasStateApi>(
 
     let mut staking_reward: u64 =
         host.state()
-            .calc_lock_staking_reward(&ctx.sender(), &params.start_at, None)?;
+            .calc_lock_staking_reward(sender, &params.start_at, None)?;
 
     let mut early_fee: u64 = 0;
 
@@ -1046,7 +1039,7 @@ fn contract_view_unstake<S: HasStateApi>(
         }
         let left_days = u64::from(lock_state.duration) - staking_days;
         let raw_early_fee: u64 = host.state().calc_lock_staking_reward(
-            &ctx.sender(),
+            sender,
             &params.start_at,
             Some(left_days.into()),
         )?;
@@ -1105,6 +1098,29 @@ fn contract_view_stake<S: HasStateApi>(
     let params: ViewStakeParams = ctx.parameter_cursor().get()?;
     let staked_ovl_credits = host.state().get_staked_ovl_credits(&params.owner);
     let stake_state = host.state().stakes.get(&params.owner).unwrap();
+    let state = ViewStakeResponse {
+        amount: stake_state.amount,
+        tier: stake_state.tier,
+        staked_ovl_credits: staked_ovl_credits,
+        ovl_credit_amount: stake_state.ovl_credit_amount,
+        available_ovl_credit_amount: stake_state.available_ovl_credit_amount,
+        locks: stake_state.locks.clone(),
+    };
+    Ok(state)
+}
+
+#[receive(
+    contract = "ovl_staking",
+    name = "viewOwnStake",
+    return_value = "ViewStakeResponse",
+    error = "ContractError"
+)]
+fn contract_view_own_stake<S: HasStateApi>(
+    ctx: &impl HasReceiveContext,
+    host: &impl HasHost<State<S>, StateApiType = S>,
+) -> ContractResult<ViewStakeResponse> {
+    let staked_ovl_credits = host.state().get_staked_ovl_credits(&Address::from(ctx.invoker()));
+    let stake_state = host.state().stakes.get(&Address::from(ctx.invoker())).unwrap();
     let state = ViewStakeResponse {
         amount: stake_state.amount,
         tier: stake_state.tier,
