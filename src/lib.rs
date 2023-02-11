@@ -1,11 +1,10 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 use concordium_cis2::*;
 use concordium_std::*;
-use strum::IntoEnumIterator;
 use strum::EnumIter;
+use strum::IntoEnumIterator;
 
 const TOKEN_ID_OVL: ContractTokenId = TokenIdUnit();
-
 type ContractTokenId = TokenIdUnit;
 type OvlCreditAmount = u64;
 type OvlAmount = TokenAmountU64;
@@ -13,6 +12,12 @@ type ProjectAddress = ContractAddress;
 type Threshold = u64;
 type ContractTokenAmount = TokenAmountU64;
 type OnReceivingCis2Parameter = OnReceivingCis2Params<ContractTokenId, ContractTokenAmount>;
+
+const BONUS_RATE: u16 = 166;
+const BONUS_RATE_RATIO: u128 = 1000000;
+const BONUS_DURATION: u128 = 100;
+const MIN_STAKING_DURATION: u16 = 30;
+const MAX_STAKING_DURATION: u16 = 730;
 
 #[derive(Debug, Serialize, SchemaType, Clone)]
 struct TierBaseState {
@@ -22,14 +27,43 @@ struct TierBaseState {
     rate: u64,
 }
 
+#[derive(Debug, Serialize, SchemaType, Clone)]
+struct LockState {
+    // ステーキングされているOVLの量
+    amount: OvlAmount,
+    // ステーキング期間(日数)
+    duration: u16,
+    // 報酬倍率(10000分率)
+    bonus_rate: u16,
+    // 開始時間
+    start_at: Timestamp,
+    // 終了時間
+    end_at: Timestamp,
+}
+
+impl LockState {
+    fn new(
+        amount: OvlAmount,
+        duration: u16,
+        bonus_rate: u16,
+        start_at: Timestamp,
+        end_at: Timestamp,
+    ) -> Self {
+        LockState {
+            amount: amount,
+            duration: duration,
+            bonus_rate: bonus_rate,
+            start_at: start_at,
+            end_at: end_at,
+        }
+    }
+}
+
 #[derive(Debug, Serial, DeserialWithState, Deletable, StateClone)]
 #[concordium(state_parameter = "S")]
 struct StakeState<S> {
     // ステーキングされているOVLの総量
     amount: OvlAmount,
-    // ステーキングを始めた時間
-    start_at: Timestamp,
-    claimable_ovl: OvlAmount,
     // 現在のTierの値
     tier: u8,
     // OVL Creditを預けているプロジェクトと量
@@ -38,18 +72,19 @@ struct StakeState<S> {
     ovl_credit_amount: OvlCreditAmount,
     // 利用できるOVL Creditの総量
     available_ovl_credit_amount: OvlCreditAmount,
+    // ロックの一覧
+    locks: collections::BTreeMap<Timestamp, LockState>,
 }
 
 impl<S: HasStateApi> StakeState<S> {
-    fn new(start_at: Timestamp, state_builder: &mut StateBuilder<S>) -> Self {
+    fn new(state_builder: &mut StateBuilder<S>) -> Self {
         StakeState {
             amount: 0u64.into(),
-            start_at,
-            claimable_ovl: 0u64.into(),
             tier: 0u8.into(),
             staked_ovl_credits: state_builder.new_map(),
             ovl_credit_amount: 0u64.into(),
             available_ovl_credit_amount: 0u64.into(),
+            locks: collections::BTreeMap::new(),
         }
     }
 }
@@ -62,6 +97,8 @@ struct State<S: HasStateApi> {
     token_address: ContractAddress,
     tier_bases: collections::BTreeMap<Threshold, TierBaseState>,
     stakes: StateMap<Address, StakeState<S>, S>,
+    total_staked_amount: OvlAmount,
+    ovl_safe_amount: OvlAmount,
 }
 
 #[derive(Debug, Serialize, SchemaType)]
@@ -76,30 +113,71 @@ type UpdateTierBaseParams = Vec<TierBaseParams>;
 #[derive(Debug, Serialize, SchemaType)]
 struct InitParams {
     token_address: ContractAddress,
-    tier_bases: UpdateTierBaseParams
-}
-
-#[derive(Debug, Serialize, SchemaType)]
-struct StakeParams {
-    amount: OvlAmount,
+    tier_bases: UpdateTierBaseParams,
 }
 
 #[derive(Debug, Serialize, SchemaType)]
 struct UnstakeParams {
+    start_at: Timestamp,
+}
+
+#[derive(Debug, Serialize, SchemaType)]
+struct ViewUnstakeParams {
+    owner: Address,
+    start_at: Timestamp,
+}
+
+#[derive(Debug, Serialize, SchemaType)]
+struct ViewLockStakingRewardParams {
+    owner: Address,
+    start_at: Timestamp,
+}
+
+#[derive(Debug, Serialize, SchemaType)]
+struct ViewCalcStakingRewardParams {
     amount: OvlAmount,
+    duration: u16,
+}
+
+#[derive(Debug, Serialize, SchemaType)]
+struct ViewCalcEarlyFeeParams {
+    amount: OvlAmount,
+    duration: u16,
+    staking_days: u16,
 }
 
 #[derive(Debug, Serialize, SchemaType)]
 struct TransferFromParams {
-    from:   Address,
-    to:     Receiver,
+    from: Address,
+    to: Receiver,
     amount: ContractTokenAmount,
+}
+
+#[derive(Debug, Serialize, SchemaType)]
+struct WithdrawOvlSafeParameter {
+    amount: OvlAmount,
 }
 
 #[derive(Debug, Serialize, SchemaType)]
 struct DepositOvlCreditParams {
     project_address: ProjectAddress,
     ovl_credit_amount: OvlCreditAmount,
+}
+
+#[derive(Debug, Serialize, SchemaType)]
+struct ViewStakingRewardResponse {
+    staking_reward: u64,
+}
+
+#[derive(Debug, Serialize, SchemaType)]
+struct ViewUnstakeResponse {
+    staked_amount: u64,
+    staking_days: u16,
+    early_fee_days: u16,
+    left_days: u16,
+    early_fee: u64,
+    staking_reward: u64,
+    send_amount: u64,
 }
 
 #[derive(Debug, Serialize, SchemaType)]
@@ -119,12 +197,11 @@ type ViewTierBasesResponse = Vec<(u8, ViewTierBaseParams)>;
 #[derive(Debug, Serialize, SchemaType)]
 struct ViewStakeResponse {
     amount: OvlAmount,
-    start_at: Timestamp,
-    claimable_ovl: OvlAmount,
     tier: u8,
     staked_ovl_credits: Vec<(ProjectAddress, OvlCreditAmount)>,
     ovl_credit_amount: OvlCreditAmount,
     available_ovl_credit_amount: OvlCreditAmount,
+    locks: collections::BTreeMap<Timestamp, LockState>,
 }
 
 #[derive(Debug, Serialize, SchemaType)]
@@ -132,6 +209,8 @@ struct ViewResponse {
     admin: Address,
     paused: bool,
     token_address: ContractAddress,
+    total_staked_amount: OvlAmount,
+    ovl_safe_amount: OvlAmount,
 }
 
 #[derive(Serialize, SchemaType)]
@@ -142,7 +221,7 @@ struct SetPausedParams {
 
 #[derive(Debug, Serialize, SchemaType)]
 struct UpgradeParams {
-    module:  ModuleReference,
+    module: ModuleReference,
     migrate: Option<(OwnedEntrypointName, OwnedParameter)>,
 }
 
@@ -178,6 +257,13 @@ enum ContractError {
     InsufficientDepositedOvlCredit,
     StakeOwnerNotFound,
     InvalidSender,
+    LockNotFound,
+    InvalidDuration,
+    NotEnoughMinStakingDuration,
+    OverMaxStakingDuration,
+    OverflowError,
+    NotEnoughOvlSafe,
+    InvalidStakingDuration,
 }
 
 type ContractResult<A> = Result<A, ContractError>;
@@ -194,12 +280,16 @@ impl From<LogError> for ContractError {
 
 /// Mapping errors related to contract invocations to ContractError.
 impl<T> From<CallContractError<T>> for ContractError {
-    fn from(_cce: CallContractError<T>) -> Self { Self::InvokeContractError }
+    fn from(_cce: CallContractError<T>) -> Self {
+        Self::InvokeContractError
+    }
 }
 
 /// Mapping errors related to contract invocations to ContractError.
 impl From<TransferError> for ContractError {
-    fn from(_te: TransferError) -> Self { Self::InvokeTransferError }
+    fn from(_te: TransferError) -> Self {
+        Self::InvokeTransferError
+    }
 }
 
 /// Mapping errors related to contract upgrades to ContractError.
@@ -227,6 +317,8 @@ impl<S: HasStateApi> State<S> {
             stakes: state_builder.new_map(),
             token_address,
             tier_bases,
+            total_staked_amount: TokenAmountU64(0),
+            ovl_safe_amount: TokenAmountU64(0),
         }
     }
 
@@ -234,14 +326,30 @@ impl<S: HasStateApi> State<S> {
         &mut self,
         owner: &Address,
         amount: &ContractTokenAmount,
+        duration: u16,
         start_at: &Timestamp,
         state_builder: &mut StateBuilder<S>,
-    ) {
-        let mut stake = self.stakes.entry(*owner).or_insert_with(|| StakeState::new(*start_at, state_builder));
+    ) -> ContractResult<()> {
+        let mut stake = self
+            .stakes
+            .entry(*owner)
+            .or_insert_with(|| StakeState::new(state_builder));
 
-        // TODO: claimable_ovlの計算
+        ensure!(
+            MIN_STAKING_DURATION <= duration,
+            ContractError::NotEnoughMinStakingDuration
+        );
+        ensure!(
+            duration <= MAX_STAKING_DURATION,
+            ContractError::OverMaxStakingDuration
+        );
+
+        let end_at = Timestamp::from(*start_at)
+            .checked_add(Duration::from_days(duration.into()))
+            .ok_or(ContractError::InvalidDuration)?;
+
+        let lock_state = LockState::new(*amount, duration, BONUS_RATE, *start_at, end_at);
         stake.amount += *amount;
-        stake.start_at = *start_at;
 
         let tier_bases = &self.tier_bases;
         let mut index = tier_bases.len();
@@ -250,7 +358,7 @@ impl<S: HasStateApi> State<S> {
         for (_project_address, ovl_credit) in stake.staked_ovl_credits.iter() {
             staked_ovl_credit += *ovl_credit;
         }
-        for( threshold, tier_base ) in tier_bases.iter().rev() {
+        for (threshold, tier_base) in tier_bases.iter().rev() {
             if *threshold <= stake.amount.into() {
                 // Calculate as a percentage.
                 let calculated_ovl_credit = stake.amount * tier_base.rate.into();
@@ -262,6 +370,8 @@ impl<S: HasStateApi> State<S> {
                 stake.tier = index as u8;
                 stake.ovl_credit_amount = ovl_credit_str.parse::<u64>().unwrap();
                 stake.available_ovl_credit_amount = stake.ovl_credit_amount - staked_ovl_credit;
+                stake.locks.insert(*start_at, lock_state.clone());
+                self.total_staked_amount += *amount;
                 break;
             }
             index -= 1;
@@ -271,23 +381,33 @@ impl<S: HasStateApi> State<S> {
             stake.tier = 0;
             stake.ovl_credit_amount = stake.amount.into();
             stake.available_ovl_credit_amount = stake.ovl_credit_amount - staked_ovl_credit;
+            stake.locks.insert(*start_at, lock_state.clone());
+            self.total_staked_amount += *amount;
         }
+
+        Ok(())
     }
 
-    fn unstake(
-        &mut self,
-        owner: &Address,
-        amount: &ContractTokenAmount,
-        start_at: &Timestamp,
-    ) -> ContractResult<()> {
-        let mut stake = self.stakes.get_mut(owner).ok_or(ContractError::StakeOwnerNotFound)?;
+    fn unstake(&mut self, owner: &Address, start_at: &Timestamp) -> ContractResult<()> {
+        let mut stake = self
+            .stakes
+            .get_mut(owner)
+            .ok_or(ContractError::StakeOwnerNotFound)?;
+        let lock_state = stake
+            .locks
+            .get(start_at)
+            .ok_or(ContractError::LockNotFound)?;
 
-        // TODO: claimable_ovlの計算
         let curr_amount = u64::from(stake.amount);
+        let staked_amount = lock_state.amount;
 
-        ensure!(curr_amount >= u64::from(*amount), ContractError::InsufficientOvl);
+        ensure!(
+            curr_amount >= u64::from(staked_amount),
+            ContractError::InsufficientOvl
+        );
 
-        let after_amount = curr_amount - u64::from(*amount);
+        let after_amount = curr_amount - u64::from(staked_amount);
+
         let tier_bases = &self.tier_bases;
         let mut index = tier_bases.len();
 
@@ -295,7 +415,7 @@ impl<S: HasStateApi> State<S> {
         for (_project_address, ovl_credit) in stake.staked_ovl_credits.iter() {
             staked_ovl_credit += *ovl_credit;
         }
-        for( threshold, tier_base ) in tier_bases.iter().rev() {
+        for (threshold, tier_base) in tier_bases.iter().rev() {
             if *threshold <= after_amount {
                 // Calculate as a percentage.
                 let calculated_ovl_credit: u64 = after_amount * tier_base.rate;
@@ -306,24 +426,32 @@ impl<S: HasStateApi> State<S> {
 
                 let ovl_credit_amount = ovl_credit_str.parse::<u64>().unwrap();
 
-                ensure!(ovl_credit_amount >= staked_ovl_credit, ContractError::InsufficientOvlCredit);
+                ensure!(
+                    ovl_credit_amount >= staked_ovl_credit,
+                    ContractError::InsufficientOvlCredit
+                );
                 stake.amount = after_amount.into();
-                stake.start_at = *start_at;
                 stake.tier = index as u8;
                 stake.ovl_credit_amount = ovl_credit_amount;
                 stake.available_ovl_credit_amount = ovl_credit_amount - staked_ovl_credit;
+                stake.locks.remove(start_at);
+                self.total_staked_amount -= staked_amount;
                 break;
             }
             index -= 1;
         }
 
         if index == 0 {
-            ensure!(after_amount >= staked_ovl_credit, ContractError::InsufficientOvlCredit);
+            ensure!(
+                after_amount >= staked_ovl_credit,
+                ContractError::InsufficientOvlCredit
+            );
             stake.amount = after_amount.into();
-            stake.start_at = *start_at;
             stake.tier = 0;
             stake.ovl_credit_amount = after_amount.into();
             stake.available_ovl_credit_amount = stake.ovl_credit_amount - staked_ovl_credit;
+            stake.locks.remove(start_at);
+            self.total_staked_amount -= staked_amount;
         }
 
         Ok(())
@@ -336,12 +464,21 @@ impl<S: HasStateApi> State<S> {
         ovl_credit_amount: &OvlCreditAmount,
         state_builder: &mut StateBuilder<S>,
     ) -> ContractResult<()> {
-        let mut stake = self.stakes.entry(*owner).or_insert_with(|| StakeState::new(Timestamp::from_timestamp_millis(0), state_builder));
+        let mut stake = self
+            .stakes
+            .entry(*owner)
+            .or_insert_with(|| StakeState::new(state_builder));
 
-        ensure!(stake.available_ovl_credit_amount >= *ovl_credit_amount, ContractError::InsufficientOvlCredit);
+        ensure!(
+            stake.available_ovl_credit_amount >= *ovl_credit_amount,
+            ContractError::InsufficientOvlCredit
+        );
 
         stake.available_ovl_credit_amount -= ovl_credit_amount;
-        let mut staked_ovl_credit = stake.staked_ovl_credits.entry(project_address).or_insert_with(|| 0u64 );
+        let mut staked_ovl_credit = stake
+            .staked_ovl_credits
+            .entry(project_address)
+            .or_insert_with(|| 0u64);
         *staked_ovl_credit += *ovl_credit_amount;
 
         Ok(())
@@ -353,10 +490,19 @@ impl<S: HasStateApi> State<S> {
         project_address: ProjectAddress,
         ovl_credit_amount: &OvlCreditAmount,
     ) -> ContractResult<()> {
-        let mut stake = self.stakes.get_mut(owner).ok_or(ContractError::ProjectNotFound)?;
-        let staked_ovl_credit = stake.staked_ovl_credits.get(&project_address).ok_or(ContractError::ProjectNotFound)?;
+        let mut stake = self
+            .stakes
+            .get_mut(owner)
+            .ok_or(ContractError::ProjectNotFound)?;
+        let staked_ovl_credit = stake
+            .staked_ovl_credits
+            .get(&project_address)
+            .ok_or(ContractError::ProjectNotFound)?;
 
-        ensure!(*staked_ovl_credit >= *ovl_credit_amount, ContractError::InsufficientDepositedOvlCredit);
+        ensure!(
+            *staked_ovl_credit >= *ovl_credit_amount,
+            ContractError::InsufficientDepositedOvlCredit
+        );
 
         stake.available_ovl_credit_amount += ovl_credit_amount;
         *stake.staked_ovl_credits.get_mut(&project_address).unwrap() -= ovl_credit_amount;
@@ -367,7 +513,7 @@ impl<S: HasStateApi> State<S> {
     fn get_staked_ovl_credits(&self, owner: &Address) -> Vec<(ProjectAddress, OvlCreditAmount)> {
         let stake_state = match self.stakes.get(owner) {
             Some(v) => v,
-            None => return vec![]
+            None => return vec![],
         };
         let mut staked_ovl_credits: Vec<(ProjectAddress, OvlCreditAmount)> = Vec::new();
         for (project_address, ovl_credit) in stake_state.staked_ovl_credits.iter() {
@@ -375,13 +521,84 @@ impl<S: HasStateApi> State<S> {
         }
         return staked_ovl_credits;
     }
+
+    fn calc_lock_staking_reward(
+        &self,
+        owner: &Address,
+        start_at: &Timestamp,
+        staking_days: Option<u16>,
+    ) -> ContractResult<u64> {
+        let stake = self
+            .stakes
+            .get(owner)
+            .ok_or(ContractError::StakeOwnerNotFound)?;
+        let lock_state = stake
+            .locks
+            .get(start_at)
+            .ok_or(ContractError::LockNotFound)?;
+
+        let amount = lock_state.amount;
+        let bonus_rate = lock_state.bonus_rate;
+        let duration = lock_state.duration;
+        let staking_days: u16 = staking_days.unwrap_or(duration);
+
+        let staking_reward: u64 =
+            self.calc_staking_reward(amount, bonus_rate, duration, staking_days, true)?;
+
+        Ok(staking_reward)
+    }
+
+    fn calc_staking_reward(
+        &self,
+        amount: OvlAmount,
+        bonus_rate: u16,
+        duration: u16,
+        staking_days: u16,
+        already_staked: bool,
+    ) -> ContractResult<u64> {
+        let total_ovl_safe_amount: u128 = u64::from(self.ovl_safe_amount).into();
+        let mut total_staked_ovl_amount: OvlAmount = self.total_staked_amount;
+        if !already_staked {
+            total_staked_ovl_amount += amount;
+        };
+        let total_staked_amount: u128 = u64::from(total_staked_ovl_amount).into();
+        let staked_amount: u128 = u64::from(amount).into();
+        let bonus_rate: u128 = bonus_rate.into();
+        let staking_days: u128 = staking_days.into();
+        let duration: u128 = duration.into();
+
+        let daily_bonus_amount: u128 = (total_ovl_safe_amount)
+            .checked_mul(bonus_rate)
+            .ok_or(ContractError::OverflowError)?;
+        let mut total_bonus_amount = daily_bonus_amount
+            .checked_mul(staking_days)
+            .ok_or(ContractError::OverflowError)?;
+        total_bonus_amount = total_bonus_amount
+            .checked_mul(staked_amount)
+            .ok_or(ContractError::OverflowError)?;
+
+        let mut staking_reward_u128: u128 = total_bonus_amount * (BONUS_DURATION + duration);
+        // 大きい数から割り算
+        // 全ユーザーのステーキング総量からに対する割合
+        staking_reward_u128 = staking_reward_u128 / total_staked_amount;
+        // BONUS_RATE_RATIOで割る
+        staking_reward_u128 = staking_reward_u128 / BONUS_RATE_RATIO;
+        // 倍率があがる日数で割る
+        staking_reward_u128 = staking_reward_u128 / BONUS_DURATION;
+
+        // u64の最大値よりも小さい数である必要がある
+        ensure!(
+            staking_reward_u128 <= u128::from(u64::MAX),
+            ContractError::OverflowError
+        );
+        let staking_reward: u64 = staking_reward_u128 as u64;
+
+        Ok(staking_reward)
+    }
 }
 
 /// Init function that creates a new contract.
-#[init(
-    contract = "ovl_staking",
-    parameter = "InitParams",
-)]
+#[init(contract = "ovl_staking", parameter = "InitParams")]
 fn contract_init<S: HasStateApi>(
     ctx: &impl HasInitContext,
     state_builder: &mut StateBuilder<S>,
@@ -393,22 +610,19 @@ fn contract_init<S: HasStateApi>(
     for TierBaseParams {
         threshold,
         max_alloc,
-        rate
+        rate,
     } in params.tier_bases
     {
-        tier_bases.entry(threshold).or_insert_with(|| TierBaseState {
-            max_alloc: max_alloc,
-            rate: rate,
-        });
+        tier_bases
+            .entry(threshold)
+            .or_insert_with(|| TierBaseState {
+                max_alloc: max_alloc,
+                rate: rate,
+            });
     }
 
     let invoker = Address::Account(ctx.init_origin());
-    let state = State::new(
-        state_builder,
-        invoker,
-        params.token_address,
-        tier_bases,
-    );
+    let state = State::new(state_builder, invoker, params.token_address, tier_bases);
 
     Ok(state)
 }
@@ -423,7 +637,11 @@ fn contract_update_tier_base<S: HasStateApi>(
     ctx: &impl HasReceiveContext,
     host: &mut impl HasHost<State<S>, StateApiType = S>,
 ) -> ContractResult<()> {
-    ensure_eq!(ctx.sender(), host.state().admin, ContractError::Unauthorized);
+    ensure_eq!(
+        ctx.sender(),
+        host.state().admin,
+        ContractError::Unauthorized
+    );
 
     let params: UpdateTierBaseParams = ctx.parameter_cursor().get()?;
 
@@ -434,16 +652,97 @@ fn contract_update_tier_base<S: HasStateApi>(
     for TierBaseParams {
         threshold,
         max_alloc,
-        rate
+        rate,
     } in params
     {
-        state.tier_bases.entry(threshold).or_insert_with(|| TierBaseState {
-            max_alloc: max_alloc,
-            rate: rate,
-        });
+        state
+            .tier_bases
+            .entry(threshold)
+            .or_insert_with(|| TierBaseState {
+                max_alloc: max_alloc,
+                rate: rate,
+            });
     }
 
-    // TODO: 再計算
+    Ok(())
+}
+
+#[receive(
+    contract = "ovl_staking",
+    name = "depositOvlSafe",
+    parameter = "OnReceivingCis2Parameter",
+    error = "ContractError",
+    mutable
+)]
+fn contract_deposit_ovl_safe<S: HasStateApi>(
+    ctx: &impl HasReceiveContext,
+    host: &mut impl HasHost<State<S>, StateApiType = S>,
+) -> ContractResult<()> {
+    // Sender must be contract address of token.
+    let sender = match ctx.sender() {
+        Address::Account(_) => return Err(ContractError::InvalidSender),
+        Address::Contract(sender) => sender,
+    };
+
+    let params: OnReceivingCis2Parameter = ctx.parameter_cursor().get()?;
+
+    ensure!(
+        host.state().token_address == sender,
+        ContractError::InvalidSender
+    );
+
+    host.state_mut().ovl_safe_amount += params.amount;
+
+    Ok(())
+}
+
+#[receive(
+    contract = "ovl_staking",
+    name = "withdrawOvlSafe",
+    parameter = "WithdrawOvlSafeParameter",
+    error = "ContractError",
+    mutable
+)]
+fn contract_withdraw_ovl_safe<S: HasStateApi>(
+    ctx: &impl HasReceiveContext,
+    host: &mut impl HasHost<State<S>, StateApiType = S>,
+) -> ContractResult<()> {
+    // Sender must be account address.
+    let sender = match ctx.sender() {
+        Address::Account(sender) => sender,
+        Address::Contract(_) => return Err(ContractError::InvalidSender),
+    };
+
+    ensure_eq!(
+        ctx.sender(),
+        host.state().admin,
+        ContractError::Unauthorized
+    );
+
+    let params: WithdrawOvlSafeParameter = ctx.parameter_cursor().get()?;
+    let token_address = host.state().token_address;
+
+    ensure!(
+        params.amount <= host.state().ovl_safe_amount,
+        ContractError::NotEnoughOvlSafe
+    );
+
+    let transfer = Transfer {
+        token_id: TOKEN_ID_OVL,
+        amount: params.amount,
+        from: Address::Contract(ctx.self_address()),
+        to: Receiver::Account(sender),
+        data: AdditionalData::empty(),
+    };
+
+    host.invoke_contract(
+        &token_address,
+        &TransferParams::from(vec![transfer]),
+        EntrypointName::new_unchecked("transfer"),
+        Amount::zero(),
+    )?;
+
+    host.state_mut().ovl_safe_amount -= params.amount;
 
     Ok(())
 }
@@ -467,12 +766,31 @@ fn contract_stake<S: HasStateApi>(
         Address::Contract(sender) => sender,
     };
 
-    ensure!(host.state().token_address == sender, ContractError::InvalidSender);
+    ensure!(
+        host.state().token_address == sender,
+        ContractError::InvalidSender
+    );
 
     let params: OnReceivingCis2Parameter = ctx.parameter_cursor().get()?;
+    let duration: u16 = from_bytes(params.data.as_ref())?;
+    ensure!(
+        duration < MIN_STAKING_DURATION,
+        ContractError::InvalidStakingDuration
+    );
+
+    ensure!(
+        MAX_STAKING_DURATION < duration,
+        ContractError::InvalidStakingDuration
+    );
 
     let (state, builder) = host.state_and_builder();
-    state.stake(&params.from, &params.amount, &ctx.metadata().slot_time(), builder);
+    state.stake(
+        &Address::Account(ctx.invoker()),
+        &params.amount,
+        duration,
+        &ctx.metadata().slot_time(),
+        builder,
+    )?;
 
     Ok(())
 }
@@ -492,30 +810,68 @@ fn contract_unstake<S: HasStateApi>(
 
     let params: UnstakeParams = ctx.parameter_cursor().get()?;
 
-    let sender = match ctx.sender() {
-        Address::Account(sender) => sender,
-        Address::Contract(_) => return Err(ContractError::Unauthorized),
-    };
+    let token_address = host.state().token_address;
+    let now = ctx.metadata().slot_time();
 
-    let state = host.state_mut();
-    state.unstake(&ctx.sender(), &params.amount, &ctx.metadata().slot_time())?;
+    let invoker = &Address::from(ctx.invoker());
+    let stake = host
+        .state()
+        .stakes
+        .get(invoker)
+        .ok_or(ContractError::StakeOwnerNotFound)?;
+    let lock_state = stake
+        .locks
+        .get(&params.start_at)
+        .ok_or(ContractError::LockNotFound)?;
+    let mut staking_reward: u64 = 0;
+    let mut send_amount = 0;
+    let mut early_fee: u64 = 0;
+    let mut left_days: u16 = 0;
+    let mut staking_days: u16 = lock_state.duration;
+    let mut early_fee_days: u16 = 0;
+    let staked_amount = u64::from(lock_state.amount);
+
+    if now < lock_state.end_at {
+        // early fee
+        staking_days = now.duration_between(lock_state.start_at).days() as u16;
+        early_fee_days = cmp::max(MIN_STAKING_DURATION, lock_state.duration / 2);
+        left_days = lock_state.duration - staking_days;
+        early_fee = host.state().calc_lock_staking_reward(
+            invoker,
+            &params.start_at,
+            Some(early_fee_days),
+        )?;
+        if early_fee < staked_amount {
+            send_amount = staked_amount - early_fee;
+        } else {
+            early_fee = staked_amount;
+        }
+    } else {
+        staking_reward = host
+            .state()
+            .calc_lock_staking_reward(invoker, &params.start_at, None)?;
+        send_amount = staked_amount + staking_reward;
+    }
 
     let transfer = Transfer {
         token_id: TOKEN_ID_OVL,
-        amount: params.amount,
+        amount: TokenAmountU64::from(send_amount),
         from: Address::Contract(ctx.self_address()),
-        to: Receiver::Account(sender),
+        to: Receiver::Account(ctx.invoker()),
         data: AdditionalData::empty(),
     };
-
-    let token_address = host.state().token_address;
 
     host.invoke_contract(
         &token_address,
         &TransferParams::from(vec![transfer]),
         EntrypointName::new_unchecked("transfer"),
-        Amount::zero()
+        Amount::zero(),
     )?;
+
+    let state = host.state_mut();
+    state.ovl_safe_amount -= TokenAmountU64(staking_reward);
+    state.ovl_safe_amount += TokenAmountU64(early_fee);
+    state.unstake(invoker, &params.start_at)?;
 
     Ok(())
 }
@@ -537,7 +893,12 @@ fn contract_deposit_ovl_credit<S: HasStateApi>(
     let sender = Address::from(ctx.invoker());
 
     let (state, builder) = host.state_and_builder();
-    state.deposit_ovl_credit(&sender, params.project_address, &params.ovl_credit_amount, builder)?;
+    state.deposit_ovl_credit(
+        &sender,
+        params.project_address,
+        &params.ovl_credit_amount,
+        builder,
+    )?;
 
     Ok(())
 }
@@ -598,8 +959,168 @@ fn contract_view<S: HasStateApi>(
         admin: state.admin,
         paused: state.paused,
         token_address: state.token_address,
+        total_staked_amount: state.total_staked_amount,
+        ovl_safe_amount: state.ovl_safe_amount,
     };
     Ok(response)
+}
+
+#[receive(
+    contract = "ovl_staking",
+    name = "viewLockStakingReward",
+    parameter = "ViewLockStakingRewardParams",
+    return_value = "ViewStakingRewardResponse",
+    error = "ContractError"
+)]
+fn contract_view_lock_staking_reward<S: HasStateApi>(
+    ctx: &impl HasReceiveContext,
+    host: &impl HasHost<State<S>, StateApiType = S>,
+) -> ContractResult<ViewStakingRewardResponse> {
+    ensure!(!host.state().paused, ContractError::ContractPaused);
+
+    let params: ViewLockStakingRewardParams = ctx.parameter_cursor().get()?;
+    let staking_reward: u64 =
+        host.state()
+            .calc_lock_staking_reward(&params.owner, &params.start_at, None)?;
+
+    Ok(ViewStakingRewardResponse { staking_reward })
+}
+
+#[receive(
+    contract = "ovl_staking",
+    name = "viewCalcStakingReward",
+    parameter = "ViewCalcStakingRewardParams",
+    return_value = "ViewStakingRewardResponse",
+    error = "ContractError"
+)]
+fn contract_view_calc_staking_reward<S: HasStateApi>(
+    ctx: &impl HasReceiveContext,
+    host: &impl HasHost<State<S>, StateApiType = S>,
+) -> ContractResult<ViewStakingRewardResponse> {
+    ensure!(!host.state().paused, ContractError::ContractPaused);
+
+    let params: ViewCalcStakingRewardParams = ctx.parameter_cursor().get()?;
+    let staking_reward: u64 = host.state().calc_staking_reward(
+        params.amount,
+        BONUS_RATE,
+        params.duration,
+        params.duration,
+        false,
+    )?;
+
+    Ok(ViewStakingRewardResponse { staking_reward })
+}
+
+#[receive(
+    contract = "ovl_staking",
+    name = "viewUnstake",
+    parameter = "ViewUnstakeParams",
+    return_value = "ViewUnstakeResponse",
+    error = "ContractError"
+)]
+fn contract_view_unstake<S: HasStateApi>(
+    ctx: &impl HasReceiveContext,
+    host: &impl HasHost<State<S>, StateApiType = S>,
+) -> ContractResult<ViewUnstakeResponse> {
+    ensure!(!host.state().paused, ContractError::ContractPaused);
+
+    let params: ViewUnstakeParams = ctx.parameter_cursor().get()?;
+    let sender = &params.owner;
+    let now = ctx.metadata().slot_time();
+    let stake = host
+        .state()
+        .stakes
+        .get(sender)
+        .ok_or(ContractError::StakeOwnerNotFound)?;
+    let lock_state = stake
+        .locks
+        .get(&params.start_at)
+        .ok_or(ContractError::LockNotFound)?;
+    let mut staking_reward: u64 = 0;
+    let mut send_amount = 0;
+    let mut early_fee: u64 = 0;
+    let mut left_days: u16 = 0;
+    let mut staking_days: u16 = lock_state.duration;
+    let mut early_fee_days: u16 = 0;
+    let staked_amount = u64::from(lock_state.amount);
+
+    if now < lock_state.end_at {
+        // early fee
+        staking_days = now.duration_between(lock_state.start_at).days() as u16;
+        early_fee_days = cmp::max(MIN_STAKING_DURATION, lock_state.duration / 2);
+        left_days = lock_state.duration - staking_days;
+        early_fee = host.state().calc_lock_staking_reward(
+            sender,
+            &params.start_at,
+            Some(early_fee_days),
+        )?;
+        if early_fee < staked_amount {
+            send_amount = staked_amount - early_fee;
+        } else {
+            early_fee = staked_amount;
+        }
+    } else {
+        staking_reward = host
+            .state()
+            .calc_lock_staking_reward(sender, &params.start_at, None)?;
+        send_amount = staked_amount + staking_reward;
+    }
+
+    Ok(ViewUnstakeResponse {
+        staked_amount,
+        staking_days,
+        early_fee_days,
+        left_days,
+        early_fee,
+        staking_reward,
+        send_amount,
+    })
+}
+
+#[receive(
+    contract = "ovl_staking",
+    name = "viewCalcEarlyFee",
+    parameter = "ViewCalcEarlyFeeParams",
+    return_value = "ViewUnstakeResponse",
+    error = "ContractError"
+)]
+fn contract_view_calc_early_fee<S: HasStateApi>(
+    ctx: &impl HasReceiveContext,
+    host: &impl HasHost<State<S>, StateApiType = S>,
+) -> ContractResult<ViewUnstakeResponse> {
+    ensure!(!host.state().paused, ContractError::ContractPaused);
+
+    let params: ViewCalcEarlyFeeParams = ctx.parameter_cursor().get()?;
+
+    let staking_reward: u64 = 0;
+    let mut send_amount: u64 = 0;
+    let staked_amount: u64 = u64::from(params.amount);
+    let duration: u16 = params.duration;
+
+    // early fee
+    let staking_days = &params.staking_days;
+    let early_fee_days = cmp::max(MIN_STAKING_DURATION, duration / 2);
+    let left_days = duration - staking_days;
+    let early_fee: u64 = host.state().calc_staking_reward(
+        params.amount,
+        BONUS_RATE,
+        duration,
+        early_fee_days,
+        false,
+    )?;
+    if early_fee < staked_amount {
+        send_amount = staked_amount - early_fee;
+    }
+
+    Ok(ViewUnstakeResponse {
+        staked_amount,
+        staking_days: params.staking_days,
+        early_fee_days: early_fee_days.into(),
+        left_days: left_days.into(),
+        early_fee,
+        staking_reward,
+        send_amount,
+    })
 }
 
 #[receive(
@@ -622,7 +1143,7 @@ fn contract_view_tier_bases<S: HasStateApi>(
                 threshold: *threshold,
                 max_alloc: tier_base.max_alloc,
                 rate: tier_base.rate,
-            }
+            },
         ));
         index += 1;
     }
@@ -645,12 +1166,11 @@ fn contract_view_stake<S: HasStateApi>(
     let stake_state = host.state().stakes.get(&params.owner).unwrap();
     let state = ViewStakeResponse {
         amount: stake_state.amount,
-        start_at: stake_state.start_at,
-        claimable_ovl: stake_state.claimable_ovl,
         tier: stake_state.tier,
         staked_ovl_credits: staked_ovl_credits,
         ovl_credit_amount: stake_state.ovl_credit_amount,
         available_ovl_credit_amount: stake_state.available_ovl_credit_amount,
+        locks: stake_state.locks.clone(),
     };
     Ok(state)
 }
@@ -686,7 +1206,11 @@ fn contract_update_admin<S: HasStateApi>(
     host: &mut impl HasHost<State<S>, StateApiType = S>,
 ) -> ContractResult<()> {
     // Check that only the current admin is authorized to update the admin address.
-    ensure_eq!(ctx.sender(), host.state().admin, ContractError::Unauthorized);
+    ensure_eq!(
+        ctx.sender(),
+        host.state().admin,
+        ContractError::Unauthorized
+    );
 
     // Parse the parameter.
     let new_admin = ctx.parameter_cursor().get()?;
@@ -708,7 +1232,11 @@ fn contract_set_paused<S: HasStateApi>(
     ctx: &impl HasReceiveContext,
     host: &mut impl HasHost<State<S>, StateApiType = S>,
 ) -> ContractResult<()> {
-    ensure_eq!(ctx.sender(), host.state().admin, ContractError::Unauthorized);
+    ensure_eq!(
+        ctx.sender(),
+        host.state().admin,
+        ContractError::Unauthorized
+    );
 
     let params: SetPausedParams = ctx.parameter_cursor().get()?;
 
@@ -763,11 +1291,6 @@ mod tests {
     const NEW_ADMIN_ACCOUNT: AccountAddress = AccountAddress([3u8; 32]);
     const NEW_ADMIN_ADDRESS: Address = Address::Account(NEW_ADMIN_ACCOUNT);
 
-    // The metadata url for the wCCD token.
-    // const INITIAL_TOKEN_METADATA_URL: &str = "https://some.example/token/wccd";
-
-    /// Test helper function which creates a contract state where ADDRESS_0 owns
-    /// 400 tokens.
     fn initial_state<S: HasStateApi>(state_builder: &mut StateBuilder<S>) -> State<S> {
         let tier1 = TierBaseState {
             max_alloc: 2,
@@ -796,7 +1319,7 @@ mod tests {
 
         let tier_bases = collections::BTreeMap::from([
             (1000u64, tier1),
-            (2000u64,tier2),
+            (2000u64, tier2),
             (3000u64, tier3),
             (4000u64, tier4),
             (5000u64, tier5),
@@ -843,7 +1366,7 @@ mod tests {
             rate: 125,
         };
 
-        let params = vec![tier1,tier2, tier3, tier4, tier5];
+        let params = vec![tier1, tier2, tier3, tier4, tier5];
         let parameter_bytes = to_bytes(&params);
         ctx.set_parameter(&parameter_bytes);
 
@@ -875,6 +1398,73 @@ mod tests {
     }
 
     #[concordium_test]
+    fn test_calc_lock_staking_reward() {
+        // Set up the context
+        let mut ctx = TestReceiveContext::empty();
+        ctx.set_sender(ADMIN_ADDRESS);
+
+        let self_address = ContractAddress::new(2250, 0);
+        ctx.set_self_address(self_address);
+
+        ctx.metadata_mut()
+            .set_slot_time(Timestamp::from_timestamp_millis(100));
+
+        let mut state_builder = TestStateBuilder::new();
+        let mut state = initial_state(&mut state_builder);
+        let now = &Timestamp::from_timestamp_millis(100);
+        let result1 = state.stake(
+            &ADMIN_ADDRESS,
+            &TokenAmountU64::from(33000000_000000),
+            30u16.into(),
+            now,
+            &mut state_builder,
+        );
+        println!("{:?}", result1);
+        let mut host = TestHost::new(state, state_builder);
+
+        host.state_mut().ovl_safe_amount += TokenAmountU64(100000000_000000);
+
+        let params2 = ViewLockStakingRewardParams {
+            owner: ADMIN_ADDRESS,
+            start_at: *now,
+        };
+        let parameter_bytes2 = to_bytes(&params2);
+        ctx.set_parameter(&parameter_bytes2);
+        let result2: ContractResult<ViewStakingRewardResponse> =
+            contract_view_lock_staking_reward(&ctx, &mut host);
+        println!("{:?}", result2);
+    }
+
+    #[concordium_test]
+    fn test_calc_staking_reward() {
+        // Set up the context
+        let mut ctx = TestReceiveContext::empty();
+        ctx.set_sender(ADMIN_ADDRESS);
+
+        let self_address = ContractAddress::new(2250, 0);
+        ctx.set_self_address(self_address);
+
+        ctx.metadata_mut()
+            .set_slot_time(Timestamp::from_timestamp_millis(100));
+
+        let mut state_builder = TestStateBuilder::new();
+        let state = initial_state(&mut state_builder);
+        let mut host = TestHost::new(state, state_builder);
+
+        host.state_mut().ovl_safe_amount += TokenAmountU64(100000000_000000);
+
+        let params1 = ViewCalcStakingRewardParams {
+            amount: TokenAmountU64(33000000_000000),
+            duration: 30u16,
+        };
+        let parameter_bytes1 = to_bytes(&params1);
+        ctx.set_parameter(&parameter_bytes1);
+        let result1: ContractResult<ViewStakingRewardResponse> =
+            contract_view_calc_staking_reward(&ctx, &mut host);
+        println!("{:?}", result1);
+    }
+
+    #[concordium_test]
     fn test_stake() {
         // Set up the context
         let mut ctx = TestReceiveContext::empty();
@@ -883,18 +1473,25 @@ mod tests {
         let self_address = ContractAddress::new(2250, 0);
         ctx.set_self_address(self_address);
 
-        ctx.metadata_mut().set_slot_time(Timestamp::from_timestamp_millis(100));
+        ctx.metadata_mut()
+            .set_slot_time(Timestamp::from_timestamp_millis(100));
 
         // Set up the parameter.
-        let params = StakeParams {
-            amount:   ContractTokenAmount::from(1000),
-        };
-        let parameter_bytes = to_bytes(&params);
-        ctx.set_parameter(&parameter_bytes);
+        // let params = OnReceivingCis2Parameter {
+        //     duration:  30u16.into(),
+        // };
+        // let parameter_bytes = to_bytes(&params);
+        // ctx.set_parameter(&parameter_bytes);
 
         let mut state_builder = TestStateBuilder::new();
         let mut state = initial_state(&mut state_builder);
-        state.stake(&ADMIN_ADDRESS, &TokenAmountU64::from(500), &ctx.metadata().slot_time(), &mut state_builder);
+        state.stake(
+            &ADMIN_ADDRESS,
+            &TokenAmountU64::from(500),
+            30u16.into(),
+            &ctx.metadata().slot_time(),
+            &mut state_builder,
+        );
         let mut host = TestHost::new(state, state_builder);
 
         // TODO: need contract mock
@@ -905,7 +1502,7 @@ mod tests {
         // claim!(result.is_ok(), "Results in rejection");
 
         let params2 = ViewStakeParams {
-            owner:   ADMIN_ADDRESS
+            owner: ADMIN_ADDRESS,
         };
         let parameter_bytes2 = to_bytes(&params2);
         ctx.set_parameter(&parameter_bytes2);
@@ -922,22 +1519,29 @@ mod tests {
         let self_address = ContractAddress::new(2250, 0);
         ctx.set_self_address(self_address);
 
-        ctx.metadata_mut().set_slot_time(Timestamp::from_timestamp_millis(100));
+        ctx.metadata_mut()
+            .set_slot_time(Timestamp::from_timestamp_millis(100));
 
         let mut state_builder = TestStateBuilder::new();
         let mut state = initial_state(&mut state_builder);
 
         // first stake
-        state.stake(&ADMIN_ADDRESS, &ContractTokenAmount::from(5000), &ctx.metadata().slot_time(), &mut state_builder);
+        state.stake(
+            &ADMIN_ADDRESS,
+            &TokenAmountU64::from(5000),
+            30u16.into(),
+            &ctx.metadata().slot_time(),
+            &mut state_builder,
+        );
 
         // first unstake
-        let unstake_result = state.unstake(&ADMIN_ADDRESS,  &ContractTokenAmount::from(1000), &ctx.metadata().slot_time());
+        let unstake_result = state.unstake(&ADMIN_ADDRESS, &ctx.metadata().slot_time());
         println!("{:?}", unstake_result);
 
         let mut host = TestHost::new(state, state_builder);
 
         let params = ViewStakeParams {
-            owner: ADMIN_ADDRESS
+            owner: ADMIN_ADDRESS,
         };
         let parameter_bytes = to_bytes(&params);
         ctx.set_parameter(&parameter_bytes);
@@ -954,19 +1558,26 @@ mod tests {
         let self_address = ContractAddress::new(2250, 0);
         ctx.set_self_address(self_address);
 
-        ctx.metadata_mut().set_slot_time(Timestamp::from_timestamp_millis(100));
+        ctx.metadata_mut()
+            .set_slot_time(Timestamp::from_timestamp_millis(100));
 
         let mut state_builder = TestStateBuilder::new();
         let mut state = initial_state(&mut state_builder);
 
         // stake
-        state.stake(&ADMIN_ADDRESS, &ContractTokenAmount::from(5000), &ctx.metadata().slot_time(), &mut state_builder);
+        state.stake(
+            &ADMIN_ADDRESS,
+            &TokenAmountU64::from(5000),
+            30u16.into(),
+            &ctx.metadata().slot_time(),
+            &mut state_builder,
+        );
 
         let mut host = TestHost::new(state, state_builder);
 
         // deposit
         let deposit_params = DepositOvlCreditParams {
-            project_address:  ContractAddress::new(2250, 0),
+            project_address: ContractAddress::new(2250, 0),
             ovl_credit_amount: 2000,
         };
         let deposit_parameter_bytes = to_bytes(&deposit_params);
@@ -976,7 +1587,7 @@ mod tests {
 
         // withdraw
         let withdraw_params = DepositOvlCreditParams {
-            project_address:  ContractAddress::new(2250, 0),
+            project_address: ContractAddress::new(2250, 0),
             ovl_credit_amount: 1200,
         };
         let withdraw_parameter_bytes = to_bytes(&withdraw_params);
@@ -986,7 +1597,7 @@ mod tests {
 
         // view stake
         let view_params = ViewStakeParams {
-            owner: ADMIN_ADDRESS
+            owner: ADMIN_ADDRESS,
         };
 
         let view_parameter_bytes = to_bytes(&view_params);
@@ -995,7 +1606,7 @@ mod tests {
         println!("{:?}", view_result);
     }
 
-        /// Test admin can update to a new admin address.
+    /// Test admin can update to a new admin address.
     #[concordium_test]
     fn test_update_admin() {
         // Set up the context
@@ -1012,7 +1623,11 @@ mod tests {
         let mut host = TestHost::new(state, state_builder);
 
         // Check the admin state.
-        claim_eq!(host.state().admin, ADMIN_ADDRESS, "Admin should be the old admin address");
+        claim_eq!(
+            host.state().admin,
+            ADMIN_ADDRESS,
+            "Admin should be the old admin address"
+        );
 
         // Call the contract function.
         let result: ContractResult<()> = contract_update_admin(&ctx, &mut host);
@@ -1021,7 +1636,11 @@ mod tests {
         claim!(result.is_ok(), "Results in rejection");
 
         // Check the admin state.
-        claim_eq!(host.state().admin, NEW_ADMIN_ADDRESS, "Admin should be the new admin address");
+        claim_eq!(
+            host.state().admin,
+            NEW_ADMIN_ADDRESS,
+            "Admin should be the new admin address"
+        );
     }
 
     #[concordium_test]
@@ -1061,7 +1680,7 @@ mod tests {
             rate: 140,
         };
 
-        let params = vec![tier1,tier2, tier3, tier4, tier5];
+        let params = vec![tier1, tier2, tier3, tier4, tier5];
         let parameter_bytes = to_bytes(&params);
         ctx.set_parameter(&parameter_bytes);
 
@@ -1077,7 +1696,8 @@ mod tests {
         ctx = TestReceiveContext::empty();
         ctx.set_sender(ADMIN_ADDRESS);
 
-        let result2: ContractResult<ViewTierBasesResponse> = contract_view_tier_bases(&ctx, &mut host);
+        let result2: ContractResult<ViewTierBasesResponse> =
+            contract_view_tier_bases(&ctx, &mut host);
         println!("{:?}", result2);
     }
 }
