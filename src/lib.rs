@@ -13,7 +13,6 @@ type Threshold = u64;
 type ContractTokenAmount = TokenAmountU64;
 type OnReceivingCis2Parameter = OnReceivingCis2Params<ContractTokenId, ContractTokenAmount>;
 
-const BONUS_RATE: u16 = 166;
 const BONUS_RATE_RATIO: u128 = 1000000;
 const BONUS_DURATION: u128 = 100;
 const MIN_STAKING_DURATION: u16 = 30;
@@ -33,7 +32,7 @@ struct LockState {
     amount: OvlAmount,
     // ステーキング期間(日数)
     duration: u16,
-    // 報酬倍率(10000分率)
+    // 1日ごとの報酬倍率
     bonus_rate: u16,
     // 開始時間
     start_at: Timestamp,
@@ -99,6 +98,7 @@ struct State<S: HasStateApi> {
     stakes: StateMap<Address, StakeState<S>, S>,
     total_staked_amount: OvlAmount,
     ovl_safe_amount: OvlAmount,
+    bonus_rate: u16,
 }
 
 #[derive(Debug, Serialize, SchemaType)]
@@ -111,9 +111,15 @@ struct TierBaseParams {
 type UpdateTierBaseParams = Vec<TierBaseParams>;
 
 #[derive(Debug, Serialize, SchemaType)]
+struct UpdateBonusRateParams {
+    bonus_rate: u16,
+}
+
+#[derive(Debug, Serialize, SchemaType)]
 struct InitParams {
     token_address: ContractAddress,
     tier_bases: UpdateTierBaseParams,
+    bonus_rate: u16,
 }
 
 #[derive(Debug, Serialize, SchemaType)]
@@ -211,6 +217,11 @@ struct ViewResponse {
     token_address: ContractAddress,
     total_staked_amount: OvlAmount,
     ovl_safe_amount: OvlAmount,
+    bonus_rate: u16,
+    bonus_rate_ratio: u128,
+    bonus_duration: u128,
+    min_staking_duration: u16,
+    max_staking_duration: u16,
 }
 
 #[derive(Serialize, SchemaType)]
@@ -310,6 +321,7 @@ impl<S: HasStateApi> State<S> {
         admin: Address,
         token_address: ContractAddress,
         tier_bases: collections::BTreeMap<Threshold, TierBaseState>,
+        bonus_rate: u16,
     ) -> Self {
         State {
             admin,
@@ -319,6 +331,7 @@ impl<S: HasStateApi> State<S> {
             tier_bases,
             total_staked_amount: TokenAmountU64(0),
             ovl_safe_amount: TokenAmountU64(0),
+            bonus_rate,
         }
     }
 
@@ -348,7 +361,7 @@ impl<S: HasStateApi> State<S> {
             .checked_add(Duration::from_days(duration.into()))
             .ok_or(ContractError::InvalidDuration)?;
 
-        let lock_state = LockState::new(*amount, duration, BONUS_RATE, *start_at, end_at);
+        let lock_state = LockState::new(*amount, duration, self.bonus_rate, *start_at, end_at);
         stake.amount += *amount;
 
         let tier_bases = &self.tier_bases;
@@ -622,7 +635,7 @@ fn contract_init<S: HasStateApi>(
     }
 
     let invoker = Address::Account(ctx.init_origin());
-    let state = State::new(state_builder, invoker, params.token_address, tier_bases);
+    let state = State::new(state_builder, invoker, params.token_address, tier_bases, params.bonus_rate);
 
     Ok(state)
 }
@@ -663,6 +676,30 @@ fn contract_update_tier_base<S: HasStateApi>(
                 rate: rate,
             });
     }
+
+    Ok(())
+}
+
+#[receive(
+    contract = "ovl_staking",
+    name = "updateBonusRate",
+    parameter = "UpdateBonusRateParams",
+    mutable
+)]
+fn contract_update_bonus_rate<S: HasStateApi>(
+    ctx: &impl HasReceiveContext,
+    host: &mut impl HasHost<State<S>, StateApiType = S>,
+) -> ContractResult<()> {
+    ensure_eq!(
+        ctx.sender(),
+        host.state().admin,
+        ContractError::Unauthorized
+    );
+
+    let params: UpdateBonusRateParams = ctx.parameter_cursor().get()?;
+    let state = host.state_mut();
+
+    state.bonus_rate = params.bonus_rate;
 
     Ok(())
 }
@@ -961,6 +998,11 @@ fn contract_view<S: HasStateApi>(
         token_address: state.token_address,
         total_staked_amount: state.total_staked_amount,
         ovl_safe_amount: state.ovl_safe_amount,
+        bonus_rate: state.bonus_rate,
+        bonus_rate_ratio: BONUS_RATE_RATIO,
+        bonus_duration: BONUS_DURATION,
+        min_staking_duration: MIN_STAKING_DURATION,
+        max_staking_duration: MAX_STAKING_DURATION,
     };
     Ok(response)
 }
@@ -1002,7 +1044,7 @@ fn contract_view_calc_staking_reward<S: HasStateApi>(
     let params: ViewCalcStakingRewardParams = ctx.parameter_cursor().get()?;
     let staking_reward: u64 = host.state().calc_staking_reward(
         params.amount,
-        BONUS_RATE,
+        host.state().bonus_rate,
         params.duration,
         params.duration,
         false,
@@ -1103,7 +1145,7 @@ fn contract_view_calc_early_fee<S: HasStateApi>(
     let left_days = duration - staking_days;
     let early_fee: u64 = host.state().calc_staking_reward(
         params.amount,
-        BONUS_RATE,
+        host.state().bonus_rate,
         duration,
         early_fee_days,
         false,
@@ -1325,8 +1367,10 @@ mod tests {
             (5000u64, tier5),
         ]);
 
+        let bonus_rate = 166u16;
+
         let token_address = ContractAddress::new(2250, 0);
-        let state = State::new(state_builder, ADMIN_ADDRESS, token_address, tier_bases);
+        let state = State::new(state_builder, ADMIN_ADDRESS, token_address, tier_bases, bonus_rate);
         state
     }
     #[concordium_test]
