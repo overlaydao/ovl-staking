@@ -834,10 +834,7 @@ fn contract_unstake<S: HasStateApi>(
     if now < lock_state.end_at {
         // early fee
         staking_days = now.duration_between(lock_state.start_at).days() as u16;
-        early_fee_days = lock_state.duration / 2;
-        if early_fee_days < MIN_STAKING_DURATION {
-            early_fee_days = MIN_STAKING_DURATION
-        }
+        early_fee_days = cmp::max(MIN_STAKING_DURATION, lock_state.duration / 2);
         left_days = lock_state.duration - staking_days;
         early_fee = host.state().calc_lock_staking_reward(
             invoker,
@@ -1050,10 +1047,7 @@ fn contract_view_unstake<S: HasStateApi>(
     if now < lock_state.end_at {
         // early fee
         staking_days = now.duration_between(lock_state.start_at).days() as u16;
-        early_fee_days = lock_state.duration / 2;
-        if early_fee_days < MIN_STAKING_DURATION {
-            early_fee_days = MIN_STAKING_DURATION
-        }
+        early_fee_days = cmp::max(MIN_STAKING_DURATION, lock_state.duration / 2);
         left_days = lock_state.duration - staking_days;
         early_fee = host.state().calc_lock_staking_reward(
             sender,
@@ -1105,15 +1099,12 @@ fn contract_view_calc_early_fee<S: HasStateApi>(
 
     // early fee
     let staking_days = &params.staking_days;
-    let mut early_fee_days = duration / 2;
-    if early_fee_days < MIN_STAKING_DURATION {
-        early_fee_days = MIN_STAKING_DURATION
-    }
+    let early_fee_days = cmp::max(MIN_STAKING_DURATION, duration / 2);
     let left_days = duration - staking_days;
     let early_fee: u64 = host.state().calc_staking_reward(
         params.amount,
         BONUS_RATE,
-        params.duration,
+        duration,
         early_fee_days,
         false,
     )?;
