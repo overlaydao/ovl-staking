@@ -263,6 +263,7 @@ enum ContractError {
     OverMaxStakingDuration,
     OverflowError,
     NotEnoughOvlSafe,
+    InvalidStakingDuration,
 }
 
 type ContractResult<A> = Result<A, ContractError>;
@@ -772,6 +773,15 @@ fn contract_stake<S: HasStateApi>(
 
     let params: OnReceivingCis2Parameter = ctx.parameter_cursor().get()?;
     let duration: u16 = from_bytes(params.data.as_ref())?;
+    ensure!(
+        duration < MIN_STAKING_DURATION,
+        ContractError::InvalidStakingDuration
+    );
+
+    ensure!(
+        MAX_STAKING_DURATION < duration,
+        ContractError::InvalidStakingDuration
+    );
 
     let (state, builder) = host.state_and_builder();
     state.stake(
@@ -825,8 +835,8 @@ fn contract_unstake<S: HasStateApi>(
         // early fee
         staking_days = now.duration_between(lock_state.start_at).days() as u16;
         early_fee_days = lock_state.duration / 2;
-        if early_fee_days < 30 {
-            early_fee_days = 30
+        if early_fee_days < MIN_STAKING_DURATION {
+            early_fee_days = MIN_STAKING_DURATION
         }
         left_days = lock_state.duration - staking_days;
         early_fee = host.state().calc_lock_staking_reward(
@@ -1041,8 +1051,8 @@ fn contract_view_unstake<S: HasStateApi>(
         // early fee
         staking_days = now.duration_between(lock_state.start_at).days() as u16;
         early_fee_days = lock_state.duration / 2;
-        if early_fee_days < 30 {
-            early_fee_days = 30
+        if early_fee_days < MIN_STAKING_DURATION {
+            early_fee_days = MIN_STAKING_DURATION
         }
         left_days = lock_state.duration - staking_days;
         early_fee = host.state().calc_lock_staking_reward(
@@ -1096,8 +1106,8 @@ fn contract_view_calc_early_fee<S: HasStateApi>(
     // early fee
     let staking_days = &params.staking_days;
     let mut early_fee_days = duration / 2;
-    if early_fee_days < 30 {
-        early_fee_days = 30
+    if early_fee_days < MIN_STAKING_DURATION {
+        early_fee_days = MIN_STAKING_DURATION
     }
     let left_days = duration - staking_days;
     let early_fee: u64 = host.state().calc_staking_reward(
