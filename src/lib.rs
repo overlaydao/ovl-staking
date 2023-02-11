@@ -811,12 +811,12 @@ fn contract_stake<S: HasStateApi>(
     let params: OnReceivingCis2Parameter = ctx.parameter_cursor().get()?;
     let duration: u16 = from_bytes(params.data.as_ref())?;
     ensure!(
-        duration < MIN_STAKING_DURATION,
+        MIN_STAKING_DURATION <= duration,
         ContractError::InvalidStakingDuration
     );
 
     ensure!(
-        MAX_STAKING_DURATION < duration,
+        duration <= MAX_STAKING_DURATION,
         ContractError::InvalidStakingDuration
     );
 
