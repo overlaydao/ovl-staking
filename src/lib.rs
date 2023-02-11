@@ -122,6 +122,12 @@ struct UnstakeParams {
 }
 
 #[derive(Debug, Serialize, SchemaType)]
+struct ViewUnstakeParams {
+    owner: Address,
+    start_at: Timestamp,
+}
+
+#[derive(Debug, Serialize, SchemaType)]
 struct ViewLockStakingRewardParams {
     owner: Address,
     start_at: Timestamp,
@@ -131,6 +137,13 @@ struct ViewLockStakingRewardParams {
 struct ViewCalcStakingRewardParams {
     amount: OvlAmount,
     duration: u16,
+}
+
+#[derive(Debug, Serialize, SchemaType)]
+struct ViewCalcEarlyFeeParams {
+    amount: OvlAmount,
+    duration: u16,
+    staking_days: u16,
 }
 
 #[derive(Debug, Serialize, SchemaType)]
@@ -158,8 +171,13 @@ struct ViewStakingRewardResponse {
 
 #[derive(Debug, Serialize, SchemaType)]
 struct ViewUnstakeResponse {
+    staked_amount: u64,
+    staking_days: u16,
+    early_fee_days: u16,
+    left_days: u16,
     early_fee: u64,
     staking_reward: u64,
+    send_amount: u64,
 }
 
 #[derive(Debug, Serialize, SchemaType)]
@@ -507,7 +525,7 @@ impl<S: HasStateApi> State<S> {
         &self,
         owner: &Address,
         start_at: &Timestamp,
-        staking_days: Option<u128>,
+        staking_days: Option<u16>,
     ) -> ContractResult<u64> {
         let stake = self
             .stakes
@@ -518,37 +536,13 @@ impl<S: HasStateApi> State<S> {
             .get(start_at)
             .ok_or(ContractError::LockNotFound)?;
 
-        let total_ovl_safe_amount: u128 = u64::from(self.ovl_safe_amount).into();
-        let total_staked_amount: u128 = u64::from(self.total_staked_amount).into();
-        let staked_amount: u128 = u64::from(lock_state.amount).into();
-        let bonus_rate: u128 = lock_state.bonus_rate.into();
-        let staking_days: u128 = staking_days.unwrap_or(lock_state.duration.into());
+        let amount = lock_state.amount;
+        let bonus_rate = lock_state.bonus_rate;
+        let duration = lock_state.duration;
+        let staking_days: u16 = staking_days.unwrap_or(duration);
 
-        let daily_bonus_amount: u128 = (total_ovl_safe_amount)
-            .checked_mul(bonus_rate)
-            .ok_or(ContractError::OverflowError)?;
-        let mut total_bonus_amount = daily_bonus_amount
-            .checked_mul(staking_days)
-            .ok_or(ContractError::OverflowError)?;
-        total_bonus_amount = total_bonus_amount
-            .checked_mul(staked_amount)
-            .ok_or(ContractError::OverflowError)?;
-
-        let mut staking_reward_u128: u128 = total_bonus_amount * (BONUS_DURATION + staking_days);
-        // 大きい数から割り算
-        // 全ユーザーのステーキング総量からに対する割合
-        staking_reward_u128 = staking_reward_u128 / total_staked_amount;
-        // BONUS_RATE_RATIOで割る
-        staking_reward_u128 = staking_reward_u128 / BONUS_RATE_RATIO;
-        // 倍率があがる日数で割る
-        staking_reward_u128 = staking_reward_u128 / BONUS_DURATION;
-
-        // u64の最大値よりも小さい数である必要がある
-        ensure!(
-            staking_reward_u128 <= u128::from(u64::MAX),
-            ContractError::OverflowError
-        );
-        let staking_reward: u64 = staking_reward_u128 as u64;
+        let staking_reward: u64 =
+            self.calc_staking_reward(amount, bonus_rate, duration, staking_days, true)?;
 
         Ok(staking_reward)
     }
@@ -556,13 +550,21 @@ impl<S: HasStateApi> State<S> {
     fn calc_staking_reward(
         &self,
         amount: OvlAmount,
+        bonus_rate: u16,
         duration: u16,
+        staking_days: u16,
+        already_staked: bool,
     ) -> ContractResult<u64> {
         let total_ovl_safe_amount: u128 = u64::from(self.ovl_safe_amount).into();
-        let total_staked_amount: u128 = u64::from(self.total_staked_amount + amount).into();
+        let mut total_staked_ovl_amount: OvlAmount = self.total_staked_amount;
+        if !already_staked {
+            total_staked_ovl_amount += amount;
+        };
+        let total_staked_amount: u128 = u64::from(total_staked_ovl_amount).into();
         let staked_amount: u128 = u64::from(amount).into();
-        let bonus_rate: u128 = BONUS_RATE.into();
-        let staking_days: u128 = duration.into();
+        let bonus_rate: u128 = bonus_rate.into();
+        let staking_days: u128 = staking_days.into();
+        let duration: u128 = duration.into();
 
         let daily_bonus_amount: u128 = (total_ovl_safe_amount)
             .checked_mul(bonus_rate)
@@ -574,7 +576,7 @@ impl<S: HasStateApi> State<S> {
             .checked_mul(staked_amount)
             .ok_or(ContractError::OverflowError)?;
 
-        let mut staking_reward_u128: u128 = total_bonus_amount * (BONUS_DURATION + staking_days);
+        let mut staking_reward_u128: u128 = total_bonus_amount * (BONUS_DURATION + duration);
         // 大きい数から割り算
         // 全ユーザーのステーキング総量からに対する割合
         staking_reward_u128 = staking_reward_u128 / total_staked_amount;
@@ -719,7 +721,10 @@ fn contract_withdraw_ovl_safe<S: HasStateApi>(
     let params: WithdrawOvlSafeParameter = ctx.parameter_cursor().get()?;
     let token_address = host.state().token_address;
 
-    ensure!( params.amount <= host.state().ovl_safe_amount, ContractError::NotEnoughOvlSafe);
+    ensure!(
+        params.amount <= host.state().ovl_safe_amount,
+        ContractError::NotEnoughOvlSafe
+    );
 
     let transfer = Transfer {
         token_id: TOKEN_ID_OVL,
@@ -808,50 +813,53 @@ fn contract_unstake<S: HasStateApi>(
         .locks
         .get(&params.start_at)
         .ok_or(ContractError::LockNotFound)?;
-
-    let mut staking_reward: u64 =
-        host.state()
-            .calc_lock_staking_reward(invoker, &params.start_at, None)?;
-
+    let mut staking_reward: u64 = 0;
+    let mut send_amount = 0;
     let mut early_fee: u64 = 0;
+    let mut left_days: u16 = 0;
+    let mut staking_days: u16 = lock_state.duration;
+    let mut early_fee_days: u16 = 0;
+    let staked_amount = u64::from(lock_state.amount);
 
     if now < lock_state.end_at {
         // early fee
-        let staking_days = now.duration_between(lock_state.start_at).days();
-        let mut early_fee_days = staking_days / 2;
+        staking_days = now.duration_between(lock_state.start_at).days() as u16;
+        early_fee_days = lock_state.duration / 2;
         if early_fee_days < 30 {
             early_fee_days = 30
         }
-        let left_days = u64::from(lock_state.duration) - staking_days;
-        let raw_early_fee: u64 = host.state().calc_lock_staking_reward(
+        left_days = lock_state.duration - staking_days;
+        early_fee = host.state().calc_lock_staking_reward(
             invoker,
             &params.start_at,
-            Some(left_days.into()),
+            Some(early_fee_days),
         )?;
-        early_fee = raw_early_fee * early_fee_days / left_days;
-        if early_fee < staking_reward {
-            staking_reward = staking_reward - early_fee;
+        if early_fee < staked_amount {
+            send_amount = staked_amount - early_fee;
         } else {
-            early_fee = u64::from(lock_state.amount);
+            early_fee = staked_amount;
         }
+    } else {
+        staking_reward = host
+            .state()
+            .calc_lock_staking_reward(invoker, &params.start_at, None)?;
+        send_amount = staked_amount + staking_reward;
     }
 
-    if staking_reward != 0 {
-        let transfer = Transfer {
-            token_id: TOKEN_ID_OVL,
-            amount: TokenAmountU64::from(staking_reward),
-            from: Address::Contract(ctx.self_address()),
-            to: Receiver::Account(ctx.invoker()),
-            data: AdditionalData::empty(),
-        };
+    let transfer = Transfer {
+        token_id: TOKEN_ID_OVL,
+        amount: TokenAmountU64::from(send_amount),
+        from: Address::Contract(ctx.self_address()),
+        to: Receiver::Account(ctx.invoker()),
+        data: AdditionalData::empty(),
+    };
 
-        host.invoke_contract(
-            &token_address,
-            &TransferParams::from(vec![transfer]),
-            EntrypointName::new_unchecked("transfer"),
-            Amount::zero(),
-        )?;
-    }
+    host.invoke_contract(
+        &token_address,
+        &TransferParams::from(vec![transfer]),
+        EntrypointName::new_unchecked("transfer"),
+        Amount::zero(),
+    )?;
 
     let state = host.state_mut();
     state.ovl_safe_amount -= TokenAmountU64(staking_reward);
@@ -964,11 +972,9 @@ fn contract_view_lock_staking_reward<S: HasStateApi>(
     ensure!(!host.state().paused, ContractError::ContractPaused);
 
     let params: ViewLockStakingRewardParams = ctx.parameter_cursor().get()?;
-    let staking_reward: u64 = host.state().calc_lock_staking_reward(
-        &params.owner,
-        &params.start_at,
-        None,
-    )?;
+    let staking_reward: u64 =
+        host.state()
+            .calc_lock_staking_reward(&params.owner, &params.start_at, None)?;
 
     Ok(ViewStakingRewardResponse { staking_reward })
 }
@@ -989,7 +995,10 @@ fn contract_view_calc_staking_reward<S: HasStateApi>(
     let params: ViewCalcStakingRewardParams = ctx.parameter_cursor().get()?;
     let staking_reward: u64 = host.state().calc_staking_reward(
         params.amount,
+        BONUS_RATE,
         params.duration,
+        params.duration,
+        false,
     )?;
 
     Ok(ViewStakingRewardResponse { staking_reward })
@@ -998,7 +1007,7 @@ fn contract_view_calc_staking_reward<S: HasStateApi>(
 #[receive(
     contract = "ovl_staking",
     name = "viewUnstake",
-    parameter = "UnstakeParams",
+    parameter = "ViewUnstakeParams",
     return_value = "ViewUnstakeResponse",
     error = "ContractError"
 )]
@@ -1008,12 +1017,9 @@ fn contract_view_unstake<S: HasStateApi>(
 ) -> ContractResult<ViewUnstakeResponse> {
     ensure!(!host.state().paused, ContractError::ContractPaused);
 
-    let params: UnstakeParams = ctx.parameter_cursor().get()?;
-
-    let sender = &Address::from(ctx.invoker());
-
+    let params: ViewUnstakeParams = ctx.parameter_cursor().get()?;
+    let sender = &params.owner;
     let now = ctx.metadata().slot_time();
-
     let stake = host
         .state()
         .stakes
@@ -1023,37 +1029,96 @@ fn contract_view_unstake<S: HasStateApi>(
         .locks
         .get(&params.start_at)
         .ok_or(ContractError::LockNotFound)?;
-
-    let mut staking_reward: u64 =
-        host.state()
-            .calc_lock_staking_reward(sender, &params.start_at, None)?;
-
+    let mut staking_reward: u64 = 0;
+    let mut send_amount = 0;
     let mut early_fee: u64 = 0;
+    let mut left_days: u16 = 0;
+    let mut staking_days: u16 = lock_state.duration;
+    let mut early_fee_days: u16 = 0;
+    let staked_amount = u64::from(lock_state.amount);
 
     if now < lock_state.end_at {
         // early fee
-        let staking_days = now.duration_between(lock_state.start_at).days();
-        let mut early_fee_days = staking_days / 2;
+        staking_days = now.duration_between(lock_state.start_at).days() as u16;
+        early_fee_days = lock_state.duration / 2;
         if early_fee_days < 30 {
             early_fee_days = 30
         }
-        let left_days = u64::from(lock_state.duration) - staking_days;
-        let raw_early_fee: u64 = host.state().calc_lock_staking_reward(
+        left_days = lock_state.duration - staking_days;
+        early_fee = host.state().calc_lock_staking_reward(
             sender,
             &params.start_at,
-            Some(left_days.into()),
+            Some(early_fee_days),
         )?;
-        early_fee = raw_early_fee * early_fee_days / left_days;
-        if early_fee < staking_reward {
-            staking_reward = staking_reward - early_fee;
+        if early_fee < staked_amount {
+            send_amount = staked_amount - early_fee;
         } else {
-            early_fee = u64::from(lock_state.amount);
+            early_fee = staked_amount;
         }
+    } else {
+        staking_reward = host
+            .state()
+            .calc_lock_staking_reward(sender, &params.start_at, None)?;
+        send_amount = staked_amount + staking_reward;
     }
 
     Ok(ViewUnstakeResponse {
+        staked_amount,
+        staking_days,
+        early_fee_days,
+        left_days,
         early_fee,
         staking_reward,
+        send_amount,
+    })
+}
+
+#[receive(
+    contract = "ovl_staking",
+    name = "viewCalcEarlyFee",
+    parameter = "ViewCalcEarlyFeeParams",
+    return_value = "ViewUnstakeResponse",
+    error = "ContractError"
+)]
+fn contract_view_calc_early_fee<S: HasStateApi>(
+    ctx: &impl HasReceiveContext,
+    host: &impl HasHost<State<S>, StateApiType = S>,
+) -> ContractResult<ViewUnstakeResponse> {
+    ensure!(!host.state().paused, ContractError::ContractPaused);
+
+    let params: ViewCalcEarlyFeeParams = ctx.parameter_cursor().get()?;
+
+    let staking_reward: u64 = 0;
+    let mut send_amount: u64 = 0;
+    let staked_amount: u64 = u64::from(params.amount);
+    let duration: u16 = params.duration;
+
+    // early fee
+    let staking_days = &params.staking_days;
+    let mut early_fee_days = duration / 2;
+    if early_fee_days < 30 {
+        early_fee_days = 30
+    }
+    let left_days = duration - staking_days;
+    let early_fee: u64 = host.state().calc_staking_reward(
+        params.amount,
+        BONUS_RATE,
+        params.duration,
+        early_fee_days,
+        false,
+    )?;
+    if early_fee < staked_amount {
+        send_amount = staked_amount - early_fee;
+    }
+
+    Ok(ViewUnstakeResponse {
+        staked_amount,
+        staking_days: params.staking_days,
+        early_fee_days: early_fee_days.into(),
+        left_days: left_days.into(),
+        early_fee,
+        staking_reward,
+        send_amount,
     })
 }
 
@@ -1098,29 +1163,6 @@ fn contract_view_stake<S: HasStateApi>(
     let params: ViewStakeParams = ctx.parameter_cursor().get()?;
     let staked_ovl_credits = host.state().get_staked_ovl_credits(&params.owner);
     let stake_state = host.state().stakes.get(&params.owner).unwrap();
-    let state = ViewStakeResponse {
-        amount: stake_state.amount,
-        tier: stake_state.tier,
-        staked_ovl_credits: staked_ovl_credits,
-        ovl_credit_amount: stake_state.ovl_credit_amount,
-        available_ovl_credit_amount: stake_state.available_ovl_credit_amount,
-        locks: stake_state.locks.clone(),
-    };
-    Ok(state)
-}
-
-#[receive(
-    contract = "ovl_staking",
-    name = "viewOwnStake",
-    return_value = "ViewStakeResponse",
-    error = "ContractError"
-)]
-fn contract_view_own_stake<S: HasStateApi>(
-    ctx: &impl HasReceiveContext,
-    host: &impl HasHost<State<S>, StateApiType = S>,
-) -> ContractResult<ViewStakeResponse> {
-    let staked_ovl_credits = host.state().get_staked_ovl_credits(&Address::from(ctx.invoker()));
-    let stake_state = host.state().stakes.get(&Address::from(ctx.invoker())).unwrap();
     let state = ViewStakeResponse {
         amount: stake_state.amount,
         tier: stake_state.tier,
@@ -1387,11 +1429,12 @@ mod tests {
         };
         let parameter_bytes2 = to_bytes(&params2);
         ctx.set_parameter(&parameter_bytes2);
-        let result2: ContractResult<ViewStakingRewardResponse> = contract_view_lock_staking_reward(&ctx, &mut host);
+        let result2: ContractResult<ViewStakingRewardResponse> =
+            contract_view_lock_staking_reward(&ctx, &mut host);
         println!("{:?}", result2);
     }
 
-        #[concordium_test]
+    #[concordium_test]
     fn test_calc_staking_reward() {
         // Set up the context
         let mut ctx = TestReceiveContext::empty();
@@ -1415,7 +1458,8 @@ mod tests {
         };
         let parameter_bytes1 = to_bytes(&params1);
         ctx.set_parameter(&parameter_bytes1);
-        let result1: ContractResult<ViewStakingRewardResponse> = contract_view_calc_staking_reward(&ctx, &mut host);
+        let result1: ContractResult<ViewStakingRewardResponse> =
+            contract_view_calc_staking_reward(&ctx, &mut host);
         println!("{:?}", result1);
     }
 
